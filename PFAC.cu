@@ -14,7 +14,7 @@
 #define ALPHA_SIZE    4     // DNA: A, C, G, T
 #define MAX_STATES    20000
 #define THREADS_PER_BLOCK 256
-#define MAX_INPUT_LEN 10000000 // 10 MB
+#define MAX_INPUT_LEN 3221225472LL
 
 #define CUDA_CHECK(call) \
     do { \
@@ -118,7 +118,7 @@ __global__ void pfacKernel(const char *text, int n, const int *delta, const unsi
 }
 
 int main(int argc, char *argv[]) {
-    const char *input_file = "human_raw.txt";
+    const char *input_file = "raw.txt";
     if (argc > 1) input_file = argv[1];
 
     const char *motifs[] = {

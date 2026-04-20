@@ -14,7 +14,7 @@
 #define ALPHA_SIZE    4     // DNA: A, C, G, T
 #define MAX_STATES    20000
 #define MAX_PATTERNS  64
-#define MAX_INPUT_LEN 10000000 // 10 MB
+#define MAX_INPUT_LEN 3000000000ULL // 3 GB
 
 // DNA Mapping: A=0, C=1, G=2, T=3
 int dna_map(char c) {
@@ -77,7 +77,7 @@ void buildFailureLinks(AhoCorasick *ac) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *input_file = "human_raw.txt";
+    const char *input_file = "raw.txt";
     if (argc > 1) input_file = argv[1];
 
     // Load biological constraints
