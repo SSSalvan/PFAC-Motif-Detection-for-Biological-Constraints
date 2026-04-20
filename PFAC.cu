@@ -107,13 +107,13 @@ __global__ void pfacKernel(const char *text, int n, const int *delta, const unsi
         
         state = delta[state * ALPHA_SIZE + c];
         
+        // INTI DARI PFAC: Thread langsung mati (break) jika transisi bernilai -1 (tidak cocok)
+        if (state == -1) break; 
+        
         if (output[state] != 0) {
             atomicAdd(matchCount, 1);
-            // In some PFAC versions, we stop at first match from this position
             break; 
         }
-        
-        if (state == 0) break; // Reached root, no match starting here
     }
 }
 
@@ -135,7 +135,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < numMotifs; i++) {
         insertPattern(ac, motifs[i], i);
     }
-    buildFailurelessTable(ac);
+    // buildFailurelessTable(ac); // MATIKAN: GPU (PFAC) secara murni cukup menggunakan bentuk Trie, tanpa sirkulasi kegagalan.
 
     // Read DNA sequence from file
     FILE *f = fopen(input_file, "r");
