@@ -1,23 +1,41 @@
 /**
- * AC_Sequential.cu
+ * AC.cu  —  Sequential Aho-Corasick (CPU Baseline)
+ * Reference: Gagniuc et al., 2025 — Algorithms 18(12), 742.
  *
- * Standard Sequential Aho-Corasick implementation for DNA Motif Detection.
- * Uses classic failure links and a single-threaded CPU evaluation.
- * Used as a baseline to compare against GPU-based PFAC.
+ * Compile: nvcc -O2 -o AC AC.cu
+ * Run:     ./AC.exe raw.txt
+ * Run N:   ./AC.exe raw.txt 65536
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cuda_runtime.h> // Included so it cleanly compiles with nvcc
+#include <cuda_runtime.h>
 
-#define ALPHA_SIZE    4      // DNA: A, C, G, T
+#define ALPHA_SIZE    4
 #define MAX_STATES    20000
-#define MAX_INPUT_LEN 3221225472LL // Update this based on your raw.txt size
+#define MAX_PATTERNS  64
 
-// Host-side mapping
-int h_dna_map(char c) {
-    switch (c) {
+static const char *MOTIF_NAMES[] = {
+    "HOMOPOLYMER_A4","HOMOPOLYMER_C4","HOMOPOLYMER_G4","HOMOPOLYMER_T4",
+    "ECORI_GAATTC","BAMHI_GGATCC","HINDIII_AAGCTT","XHOI_CTCGAG",
+    "SALI_GTCGAC","NCOI_CCATGG","NDEI_CATATG","SPHI_GCATGC",
+    "REPEAT_ATATAT","REPEAT_TATATA","REPEAT_CGCGCG","REPEAT_GCGCGC",
+    "STR_AAGAAG","STR_CAGCAG","STR_TGCTGC",
+    "GC_RUN_GCGCGCGC","AT_RUN_ATATATATAT",
+};
+static const char *MOTIF_SEQS[] = {
+    "AAAA","CCCC","GGGG","TTTT",
+    "GAATTC","GGATCC","AAGCTT","CTCGAG",
+    "GTCGAC","CCATGG","CATATG","GCATGC",
+    "ATATAT","TATATA","CGCGCG","GCGCGC",
+    "AAGAAG","CAGCAG","TGCTGC",
+    "GCGCGCGC","ATATATATAT",
+};
+static const int NUM_MOTIFS = 21;
+
+static int h_dna_map(char c) {
+    switch(c) {
         case 'A': case 'a': return 0;
         case 'C': case 'c': return 1;
         case 'G': case 'g': return 2;
@@ -28,162 +46,115 @@ int h_dna_map(char c) {
 
 typedef struct {
     int delta[MAX_STATES][ALPHA_SIZE];
-    int fail[MAX_STATES];  // ADDED: Standard AC failure links
+    int fail[MAX_STATES];
     unsigned long long O[MAX_STATES];
     int numStates;
 } AhoCorasick;
 
-// CPU: Build the basic Trie structure
-void insertPattern(AhoCorasick *ac, const char *pattern, int patIndex) {
+static void insertPattern(AhoCorasick *ac, const char *pat, int idx) {
     int state = 0;
-    for (int i = 0; pattern[i] != '\0'; i++) {
-        int c = h_dna_map(pattern[i]);
+    for (int i = 0; pat[i]; i++) {
+        int c = h_dna_map(pat[i]);
         if (c == -1) continue;
-        if (ac->delta[state][c] == -1) {
+        if (ac->delta[state][c] == -1)
             ac->delta[state][c] = ac->numStates++;
-        }
         state = ac->delta[state][c];
     }
-    ac->O[state] |= (1ULL << patIndex);
+    ac->O[state] |= (1ULL << idx);
 }
 
-// CPU: Build the Failure Table (Standard Aho-Corasick logic)
-void buildFailureTable(AhoCorasick *ac) {
-    int queue[MAX_STATES];
-    int head = 0, tail = 0;
-
+static void buildFailureTable(AhoCorasick *ac) {
+    int queue[MAX_STATES], head = 0, tail = 0;
     ac->fail[0] = 0;
-
-    // 1. Set failure links for depth-1 nodes to root (0)
     for (int c = 0; c < ALPHA_SIZE; c++) {
         int u = ac->delta[0][c];
-        if (u != -1) {
-            ac->fail[u] = 0;
-            queue[tail++] = u;
-        } else {
-            // Root transitions to itself for missing characters
-            ac->delta[0][c] = 0; 
-        }
+        if (u != -1) { ac->fail[u] = 0; queue[tail++] = u; }
+        else ac->delta[0][c] = 0;
     }
-
-    // 2. BFS to set failure links for the rest of the Trie
     while (head < tail) {
         int r = queue[head++];
         for (int c = 0; c < ALPHA_SIZE; c++) {
             int u = ac->delta[r][c];
             if (u != -1) {
                 queue[tail++] = u;
-                
-                // Follow the failure link of the parent
                 int v = ac->fail[r];
-                while (ac->delta[v][c] == -1) {
-                    v = ac->fail[v];
-                }
-                
+                while (ac->delta[v][c] == -1) v = ac->fail[v];
                 ac->fail[u] = ac->delta[v][c];
-                
-                // Merge output flags so we catch sub-patterns
                 ac->O[u] |= ac->O[ac->fail[u]];
             }
         }
     }
 }
 
-// CPU: Sequential Standard AC Search
-int searchSequentialAC(const char *text, int n, AhoCorasick *ac) {
-    int matchCount = 0;
-    int state = 0;
-
-    for (int i = 0; i < n; i++) {
+static int searchAC(const char *text, long long n, AhoCorasick *ac,
+                    unsigned long long *motifCounts) {
+    int matches = 0, state = 0;
+    for (long long i = 0; i < n; i++) {
         int c = h_dna_map(text[i]);
-        
-        // If unknown character (like 'N' in DNA), reset state machine
-        if (c == -1) {
-            state = 0;
-            continue;
-        }
-
-        // Follow failure links until we find a valid transition
-        while (ac->delta[state][c] == -1) {
-            state = ac->fail[state];
-        }
-        
-        // Take the transition
+        if (c == -1) { state = 0; continue; }
+        while (ac->delta[state][c] == -1) state = ac->fail[state];
         state = ac->delta[state][c];
-
-        // If this state has an output flag, we found a match
-        if (ac->O[state] != 0) {
-            matchCount++;
+        if (ac->O[state]) {
+            matches++;
+            for (int p = 0; p < NUM_MOTIFS; p++)
+                if (ac->O[state] & (1ULL << p)) motifCounts[p]++;
         }
     }
-
-    return matchCount;
+    return matches;
 }
 
 int main(int argc, char *argv[]) {
     const char *input_file = "raw.txt";
+    long long use_n = -1;
     if (argc > 1) input_file = argv[1];
+    if (argc > 2) use_n = atoll(argv[2]);
 
-    const char *motifs[] = {
-        "AAAAAA", "CCCCCC", "GGGGGG", "TTTTTT", 
-        "CGCGCG", "ATATAT"
-    };
-    int numMotifs = 6;
+    printf("========================================================\n");
+    printf("  Sequential Aho-Corasick (AC) -- CPU Baseline\n");
+    printf("  Gagniuc et al., Algorithms 2025, 18, 742\n");
+    printf("========================================================\n\n");
 
     AhoCorasick *ac = (AhoCorasick *)malloc(sizeof(AhoCorasick));
     memset(ac->delta, -1, sizeof(ac->delta));
-    memset(ac->fail, 0, sizeof(ac->fail));
-    memset(ac->O, 0, sizeof(ac->O));
+    memset(ac->fail,   0, sizeof(ac->fail));
+    memset(ac->O,      0, sizeof(ac->O));
     ac->numStates = 1;
 
-    // 1. Build Trie
-    for (int i = 0; i < numMotifs; i++) {
-        insertPattern(ac, motifs[i], i);
-    }
-    
-    // 2. Build Failure Links (Crucial for Standard AC)
+    printf("[AC-Build] Loading %d motifs...\n", NUM_MOTIFS);
+    for (int i = 0; i < NUM_MOTIFS; i++) insertPattern(ac, MOTIF_SEQS[i], i);
     buildFailureTable(ac);
+    printf("[AC-Build] States: %d\n\n", ac->numStates);
 
-    // 3. Read DNA sequence from file
-    FILE *f = fopen(input_file, "r");
-    if (!f) {
-        printf("Error: Could not open %s.\n", input_file);
-        return 1;
-    }
-    
-    char *h_text = (char *)malloc(MAX_INPUT_LEN);
-    if (!h_text) {
-        printf("Error: Failed to allocate memory for DNA sequence.\n");
-        fclose(f);
-        return 1;
-    }
-    
-    int n = fread(h_text, 1, MAX_INPUT_LEN, f);
-    fclose(f);
+    FILE *fp = fopen(input_file, "r");
+    if (!fp) { printf("[ERROR] Cannot open %s\n", input_file); return 1; }
+    fseek(fp, 0, SEEK_END);
+    long long file_size = ftell(fp); fseek(fp, 0, SEEK_SET);
+    long long alloc_n = (use_n > 0 && use_n < file_size) ? use_n : file_size;
+    char *h_text = (char *)malloc(alloc_n + 1);
+    long long n = (long long)fread(h_text, 1, alloc_n, fp);
+    fclose(fp); h_text[n] = '\0';
 
-    printf("Scanning DNA sequence (%d bases) with Sequential Standard AC (CPU)...\n", n);
+    printf("[AC] Scanning %lld bases...\n\n", n);
+    unsigned long long motifCounts[MAX_PATTERNS] = {0};
 
-    // 4. Time the Sequential CPU Search using CUDA Events (for apples-to-apples comparison)
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    int matches = searchAC(h_text, n, ac, motifCounts);
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    float ms = 0; cudaEventElapsedTime(&ms, s, e);
 
-    int h_matchCount = searchSequentialAC(h_text, n, ac);
+    printf("[Results]\n");
+    printf("  Total matches : %d\n", matches);
+    printf("  CPU time      : %.4f ms\n", ms);
+    printf("  Throughput    : %.4f GB/s\n\n", (n/1e9)/(ms/1000.0));
+    printf("  %-28s  Count\n", "Motif");
+    printf("  %-28s  -----\n", "----------------------------");
+    for (int p = 0; p < NUM_MOTIFS; p++)
+        if (motifCounts[p] > 0)
+            printf("  %-28s  %llu\n", MOTIF_NAMES[p], motifCounts[p]);
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
-    printf("Total matches found: %d\n", h_matchCount);
-    printf("CPU Execution time: %.4f ms\n", milliseconds);
-
-    // Cleanup
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    free(ac);
-    free(h_text);
-
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    free(ac); free(h_text);
+    printf("\n[Done] AC CPU scan complete.\n");
     return 0;
 }
