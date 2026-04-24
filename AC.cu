@@ -3,6 +3,7 @@
  * Reference: Gagniuc et al., 2025 — Algorithms 18(12), 742.
  *
  * Perbaikan: Menambahkan Sequence Generator agar benchmark adil dengan PFAC.
+ *            + Klasifikasi Kategori Motif (Constraint-Aware Output)
  * Compile: nvcc -O2 -o AC AC.cu
  * Run Real:    ./AC.exe raw.txt
  * Run Benchmark: ./AC.exe dummy.txt 65536
@@ -18,16 +19,29 @@
 #define MAX_STATES    20000
 #define MAX_PATTERNS  64
 
-// Generator DNA Random sesuai instruksi dosen & Research Guide
-void generate_random_dna(char *seq, long long n) {
-    const char bases[] = "ACGT";
-    srand(42); // Gunakan seed tetap agar data CPU dan GPU identik
-    for (long long i = 0; i < n; i++) {
-        seq[i] = bases[rand() % 4];
-    }
-    seq[n] = '\0';
-}
+/* ─── Definisi Kategori ─────────────────────────────────────────────────── */
+typedef enum {
+    CAT_HOMOPOLYMER  = 0,   /* synthesis hazard          → CRITICAL */
+    CAT_RESTRICTION  = 1,   /* cleavage risk             → CRITICAL */
+    CAT_DINUCLEOTIDE = 2,   /* structural instability    → HIGH     */
+    CAT_STR          = 3,   /* PCR slippage              → MEDIUM   */
+    CAT_GC_EXTREME   = 4,   /* melting temperature issue → LOW      */
+    NUM_CATEGORIES   = 5
+} MotifCategory;
 
+static const char *CAT_NAMES[] = {
+    "HOMOPOLYMER RUNS (synthesis hazard)",
+    "RESTRICTION ENZYME SITES (cleavage risk)",
+    "DINUCLEOTIDE REPEATS (structural instability)",
+    "SHORT TANDEM REPEATS (PCR slippage)",
+    "GC/AT EXTREME RUNS (melting temp)"
+};
+
+static const char *CAT_SEVERITY[] = {
+    "CRITICAL", "CRITICAL", "HIGH", "MEDIUM", "LOW"
+};
+
+/* ─── Motif definitions ─────────────────────────────────────────────────── */
 static const char *MOTIF_NAMES[] = {
     "HOMOPOLYMER_A4","HOMOPOLYMER_C4","HOMOPOLYMER_G4","HOMOPOLYMER_T4",
     "ECORI_GAATTC","BAMHI_GGATCC","HINDIII_AAGCTT","XHOI_CTCGAG",
@@ -46,6 +60,42 @@ static const char *MOTIF_SEQS[] = {
 };
 static const int NUM_MOTIFS = 21;
 
+/* Mapping motif index → kategori (urutan sama dengan MOTIF_SEQS[]) */
+static const MotifCategory MOTIF_CAT[] = {
+    CAT_HOMOPOLYMER,   /* AAAA          */
+    CAT_HOMOPOLYMER,   /* CCCC          */
+    CAT_HOMOPOLYMER,   /* GGGG          */
+    CAT_HOMOPOLYMER,   /* TTTT          */
+    CAT_RESTRICTION,   /* GAATTC        */
+    CAT_RESTRICTION,   /* GGATCC        */
+    CAT_RESTRICTION,   /* AAGCTT        */
+    CAT_RESTRICTION,   /* CTCGAG        */
+    CAT_RESTRICTION,   /* GTCGAC        */
+    CAT_RESTRICTION,   /* CCATGG        */
+    CAT_RESTRICTION,   /* CATATG        */
+    CAT_RESTRICTION,   /* GCATGC        */
+    CAT_DINUCLEOTIDE,  /* ATATAT        */
+    CAT_DINUCLEOTIDE,  /* TATATA        */
+    CAT_DINUCLEOTIDE,  /* CGCGCG        */
+    CAT_DINUCLEOTIDE,  /* GCGCGC        */
+    CAT_STR,           /* AAGAAG        */
+    CAT_STR,           /* CAGCAG        */
+    CAT_STR,           /* TGCTGC        */
+    CAT_GC_EXTREME,    /* GCGCGCGC      */
+    CAT_GC_EXTREME,    /* ATATATATAT    */
+};
+
+/* ─── Generator DNA Random ──────────────────────────────────────────────── */
+void generate_random_dna(char *seq, long long n) {
+    const char bases[] = "ACGT";
+    srand(42); /* Seed tetap agar data CPU dan GPU identik */
+    for (long long i = 0; i < n; i++) {
+        seq[i] = bases[rand() % 4];
+    }
+    seq[n] = '\0';
+}
+
+/* ─── Host helpers ──────────────────────────────────────────────────────── */
 static int h_dna_map(char c) {
     switch(c) {
         case 'A': case 'a': return 0;
@@ -56,6 +106,7 @@ static int h_dna_map(char c) {
     }
 }
 
+/* ─── Automaton ─────────────────────────────────────────────────────────── */
 typedef struct {
     int delta[MAX_STATES][ALPHA_SIZE];
     int fail[MAX_STATES];
@@ -115,6 +166,34 @@ static int searchAC(const char *text, long long n, AhoCorasick *ac,
     return matches;
 }
 
+/* ─── Print hasil dengan klasifikasi kategori ───────────────────────────── */
+static void printCategorizedResults(const unsigned long long *motifCounts) {
+    printf("\n  %-28s  %s\n", "Motif", "Count");
+    printf("  %-28s  -----\n", "----------------------------");
+
+    unsigned long long grand_total = 0;
+
+    for (int cat = 0; cat < NUM_CATEGORIES; cat++) {
+        unsigned long long cat_total = 0;
+        for (int p = 0; p < NUM_MOTIFS; p++)
+            if ((int)MOTIF_CAT[p] == cat) cat_total += motifCounts[p];
+
+        printf("\n  ── Category %d: %s ──\n", cat + 1, CAT_NAMES[cat]);
+
+        for (int p = 0; p < NUM_MOTIFS; p++) {
+            if ((int)MOTIF_CAT[p] == cat) {
+                printf("  %-28s  %llu\n", MOTIF_NAMES[p], motifCounts[p]);
+            }
+        }
+
+        printf("  %-28s  %llu  [%s]\n", "Subtotal:", cat_total, CAT_SEVERITY[cat]);
+        grand_total += cat_total;
+    }
+
+    printf("\n  %-28s  %llu\n", "GRAND TOTAL:", grand_total);
+}
+
+/* ─── main ──────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
     const char *input_file = "raw.txt";
     long long use_n = -1;
@@ -163,7 +242,7 @@ int main(int argc, char *argv[]) {
     printf("[AC] Scanning %lld bases...\n\n", n);
     unsigned long long motifCounts[MAX_PATTERNS] = {0};
 
-    cudaEvent_t s_event, e_event; 
+    cudaEvent_t s_event, e_event;
     cudaEventCreate(&s_event); cudaEventCreate(&e_event);
     cudaEventRecord(s_event);
 
@@ -175,12 +254,9 @@ int main(int argc, char *argv[]) {
     printf("[Results]\n");
     printf("  Total matches : %d\n", matches);
     printf("  CPU time      : %.4f ms\n", ms);
-    printf("  Throughput    : %.4f GB/s\n\n", (n/1e9)/(ms/1000.0));
-    printf("  %-28s  Count\n", "Motif");
-    printf("  %-28s  -----\n", "----------------------------");
-    for (int p = 0; p < NUM_MOTIFS; p++)
-        if (motifCounts[p] > 0)
-            printf("  %-28s  %llu\n", MOTIF_NAMES[p], motifCounts[p]);
+    printf("  Throughput    : %.4f GB/s\n", (n / 1e9) / (ms / 1000.0));
+
+    printCategorizedResults(motifCounts);
 
     cudaEventDestroy(s_event); cudaEventDestroy(e_event);
     free(ac); free(h_text);
