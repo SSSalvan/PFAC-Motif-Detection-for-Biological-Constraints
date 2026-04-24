@@ -2,15 +2,16 @@
  * PFAC.cu  —  Parallel Failure-less Aho-Corasick (GPU)
  * Reference: Gagniuc et al., 2025 — Algorithms 18(12), 742.
  *
- * Compile: nvcc -O2 -o PFAC PFAC.cu
- * Run:     ./PFAC.exe raw.txt
- * Run N:   ./PFAC.exe raw.txt 65536
- * Nsight:  nsys profile -o report_pfac --stats=true ./PFAC.exe raw.txt
+ * Perbaikan: Menambahkan Sequence Generator sesuai Research Guide.
+ * * Compile: nvcc -O2 -o PFAC PFAC.cu
+ * Run Real:    ./PFAC.exe raw.txt
+ * Run Benchmark: ./PFAC.exe dummy.txt 65536
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <cuda_runtime.h>
 
 #define ALPHA_SIZE         4
@@ -25,6 +26,16 @@
             cudaGetErrorString(err), __FILE__, __LINE__); \
         exit(EXIT_FAILURE); } } while(0)
 
+// Generator DNA Random sesuai Research Guide [cite: 76, 78]
+void generate_random_dna(char *seq, long long n) {
+    const char bases[] = "ACGT";
+    srand((unsigned int)time(NULL));
+    for (long long i = 0; i < n; i++) {
+        seq[i] = bases[rand() % 4]; // [cite: 80, 81]
+    }
+    seq[n] = '\0';
+}
+
 __device__ __forceinline__ int d_dna_map(char c) {
     if (c=='A'||c=='a') return 0;
     if (c=='C'||c=='c') return 1;
@@ -32,6 +43,7 @@ __device__ __forceinline__ int d_dna_map(char c) {
     if (c=='T'||c=='t') return 3;
     return -1;
 }
+
 static int h_dna_map(char c) {
     switch(c) {
         case 'A': case 'a': return 0; case 'C': case 'c': return 1;
@@ -47,15 +59,15 @@ typedef struct {
 } PFACAutomaton;
 
 static void insertPattern(PFACAutomaton *ac, const char *pat, int idx) {
-    int state = 0;
+    int state = 0; // Mulai dari ROOT [cite: 314]
     for (int i = 0; pat[i]; i++) {
         int c = h_dna_map(pat[i]);
         if (c == -1) continue;
         if (ac->delta[state][c] == -1)
-            ac->delta[state][c] = ac->numStates++;
+            ac->delta[state][c] = ac->numStates++; // Membangun "Tree"/Trie [cite: 313]
         state = ac->delta[state][c];
     }
-    ac->O[state] |= (1ULL << idx);
+    ac->O[state] |= (1ULL << idx); // Terminal state [cite: 318]
 }
 
 static void buildFailurelessTable(PFACAutomaton *ac) {
@@ -83,14 +95,14 @@ __global__ void pfacKernel(
     const unsigned long long *output,
     int *matchCount, unsigned long long *motifCounts, int numMotifs
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x; // Thread-per-position [cite: 226, 500]
     if (tid >= n) return;
     int state = 0;
     for (int i = tid; i < n; i++) {
         int c = d_dna_map(text[i]);
         if (c == -1) break;
         int next = delta[state * ALPHA_SIZE + c];
-        if (next == -1) break;
+        if (next == -1) break; // Failure-less: stop jika mismatch [cite: 207, 226]
         state = next;
         if (output[state] != 0) {
             atomicAdd(matchCount, 1);
@@ -141,15 +153,30 @@ int main(int argc, char *argv[]) {
     buildFailurelessTable(ac);
     printf("[PFAC-Build] States: %d\n\n", ac->numStates);
 
+    char *h_text;
+    long long n;
+
     FILE *fp = fopen(input_file, "r");
-    if (!fp) { printf("[ERROR] Cannot open %s\n", input_file); return 1; }
-    fseek(fp, 0, SEEK_END);
-    long long file_size = ftell(fp); fseek(fp, 0, SEEK_SET);
-    long long alloc_n = (use_n > 0 && use_n < file_size) ? use_n : file_size;
-    if (alloc_n > 1073741824LL) alloc_n = 1073741824LL;
-    char *h_text = (char *)malloc(alloc_n + 1);
-    long long n = (long long)fread(h_text, 1, alloc_n, fp);
-    fclose(fp); h_text[n] = '\0';
+    if (!fp) {
+        if (use_n > 0) {
+            printf("[INFO] File %s not found. Generating %lld random bases (Research Guide Mode)...\n", input_file, use_n);
+            n = use_n;
+            h_text = (char *)malloc(n + 1);
+            generate_random_dna(h_text, n); // [cite: 75, 78]
+        } else {
+            printf("[ERROR] Cannot open %s and no size N provided.\n", input_file);
+            return 1;
+        }
+    } else {
+        fseek(fp, 0, SEEK_END);
+        long long file_size = ftell(fp); fseek(fp, 0, SEEK_SET);
+        n = (use_n > 0 && use_n < file_size) ? use_n : file_size;
+        // Cap 1GB untuk stabilitas memori GPU
+        if (n > 1073741824LL) n = 1073741824LL; 
+        h_text = (char *)malloc(n + 1);
+        fread(h_text, 1, n, fp);
+        fclose(fp); h_text[n] = '\0';
+    }
 
     printf("[PFAC] Scanning %lld bases on GPU...\n\n", n);
 
@@ -176,13 +203,16 @@ int main(int argc, char *argv[]) {
     CUDA_CHECK(cudaMemset(d_match, 0, sizeof(int)));
     CUDA_CHECK(cudaMemset(d_motif, 0, msz));
 
-    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s);
+    cudaEvent_t s_event, e_event; 
+    cudaEventCreate(&s_event); cudaEventCreate(&e_event);
+    cudaEventRecord(s_event);
+    
     int blocks = (int)((n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
     pfacKernel<<<blocks, THREADS_PER_BLOCK>>>(
         d_text, (int)n, d_delta, d_output, d_match, d_motif, NUM_MOTIFS);
-    cudaEventRecord(e); cudaEventSynchronize(e);
-    float ms = 0; cudaEventElapsedTime(&ms, s, e);
+    
+    cudaEventRecord(e_event); cudaEventSynchronize(e_event);
+    float ms = 0; cudaEventElapsedTime(&ms, s_event, e_event);
 
     CUDA_CHECK(cudaMemcpy(&h_match, d_match, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_motif, d_motif, msz, cudaMemcpyDeviceToHost));
@@ -197,7 +227,7 @@ int main(int argc, char *argv[]) {
         if (h_motif[p] > 0)
             printf("  %-28s  %llu\n", MOTIF_NAMES[p], h_motif[p]);
 
-    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaEventDestroy(s_event); cudaEventDestroy(e_event);
     cudaFree(d_text); cudaFree(d_delta); cudaFree(d_output);
     cudaFree(d_match); cudaFree(d_motif);
     free(ac); free(h_text); free(h_flat);

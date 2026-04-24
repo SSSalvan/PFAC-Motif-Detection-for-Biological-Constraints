@@ -124,3 +124,5 @@ if __name__ == "__main__":
     # max_bases=None  → ambil semua data
     # max_bases=1_600_000_000 → ambil 1.6 miliar basa (cocok untuk VRAM GPU)
     process_fasta(INPUT_FILE, OUTPUT_FILE, max_bases=None)
+    
+    

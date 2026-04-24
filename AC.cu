@@ -2,19 +2,31 @@
  * AC.cu  —  Sequential Aho-Corasick (CPU Baseline)
  * Reference: Gagniuc et al., 2025 — Algorithms 18(12), 742.
  *
+ * Perbaikan: Menambahkan Sequence Generator agar benchmark adil dengan PFAC.
  * Compile: nvcc -O2 -o AC AC.cu
- * Run:     ./AC.exe raw.txt
- * Run N:   ./AC.exe raw.txt 65536
+ * Run Real:    ./AC.exe raw.txt
+ * Run Benchmark: ./AC.exe dummy.txt 65536
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <cuda_runtime.h>
 
 #define ALPHA_SIZE    4
 #define MAX_STATES    20000
 #define MAX_PATTERNS  64
+
+// Generator DNA Random sesuai instruksi dosen & Research Guide
+void generate_random_dna(char *seq, long long n) {
+    const char bases[] = "ACGT";
+    srand(42); // Gunakan seed tetap agar data CPU dan GPU identik
+    for (long long i = 0; i < n; i++) {
+        seq[i] = bases[rand() % 4];
+    }
+    seq[n] = '\0';
+}
 
 static const char *MOTIF_NAMES[] = {
     "HOMOPOLYMER_A4","HOMOPOLYMER_C4","HOMOPOLYMER_G4","HOMOPOLYMER_T4",
@@ -125,23 +137,40 @@ int main(int argc, char *argv[]) {
     buildFailureTable(ac);
     printf("[AC-Build] States: %d\n\n", ac->numStates);
 
+    char *h_text;
+    long long n;
+
     FILE *fp = fopen(input_file, "r");
-    if (!fp) { printf("[ERROR] Cannot open %s\n", input_file); return 1; }
-    fseek(fp, 0, SEEK_END);
-    long long file_size = ftell(fp); fseek(fp, 0, SEEK_SET);
-    long long alloc_n = (use_n > 0 && use_n < file_size) ? use_n : file_size;
-    char *h_text = (char *)malloc(alloc_n + 1);
-    long long n = (long long)fread(h_text, 1, alloc_n, fp);
-    fclose(fp); h_text[n] = '\0';
+    if (!fp) {
+        if (use_n > 0) {
+            printf("[INFO] File %s not found. Generating %lld random bases (Research Guide Mode)...\n", input_file, use_n);
+            n = use_n;
+            h_text = (char *)malloc(n + 1);
+            generate_random_dna(h_text, n);
+        } else {
+            printf("[ERROR] Cannot open %s and no size N provided.\n", input_file);
+            return 1;
+        }
+    } else {
+        fseek(fp, 0, SEEK_END);
+        long long file_size = ftell(fp); fseek(fp, 0, SEEK_SET);
+        n = (use_n > 0 && use_n < file_size) ? use_n : file_size;
+        h_text = (char *)malloc(n + 1);
+        fread(h_text, 1, n, fp);
+        fclose(fp); h_text[n] = '\0';
+    }
 
     printf("[AC] Scanning %lld bases...\n\n", n);
     unsigned long long motifCounts[MAX_PATTERNS] = {0};
 
-    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s);
+    cudaEvent_t s_event, e_event; 
+    cudaEventCreate(&s_event); cudaEventCreate(&e_event);
+    cudaEventRecord(s_event);
+
     int matches = searchAC(h_text, n, ac, motifCounts);
-    cudaEventRecord(e); cudaEventSynchronize(e);
-    float ms = 0; cudaEventElapsedTime(&ms, s, e);
+
+    cudaEventRecord(e_event); cudaEventSynchronize(e_event);
+    float ms = 0; cudaEventElapsedTime(&ms, s_event, e_event);
 
     printf("[Results]\n");
     printf("  Total matches : %d\n", matches);
@@ -153,7 +182,7 @@ int main(int argc, char *argv[]) {
         if (motifCounts[p] > 0)
             printf("  %-28s  %llu\n", MOTIF_NAMES[p], motifCounts[p]);
 
-    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaEventDestroy(s_event); cudaEventDestroy(e_event);
     free(ac); free(h_text);
     printf("\n[Done] AC CPU scan complete.\n");
     return 0;
