@@ -1,4 +1,5 @@
 import os
+import re
 
 def process_dna_half_size(input_path, output_path):
     """
@@ -36,8 +37,12 @@ def process_dna_half_size(input_path, output_path):
                     parts = line.strip().split('\t')
                     if parts:
                         sequence = parts[0]
-                        f_out.write(sequence)
-                        total_bases_saved += len(sequence)
+                        # CLEANING STRATEGY: Split at non-ACGT characters (like N)
+                        sub_sequences = re.split(r'[^ACGTacgt]', sequence)
+                        for sub_seq in sub_sequences:
+                            if len(sub_seq) > 20: 
+                                f_out.write(sub_seq.upper())
+                                total_bases_saved += len(sub_seq)
 
                     # Show progress every 250MB so you know it's not frozen
                     if bytes_processed % (250 * 1024 * 1024) < 1000:
@@ -58,7 +63,7 @@ def process_dna_half_size(input_path, output_path):
 if __name__ == "__main__":
     # Ensure these paths match your folder structure
     DATASET_DIR = "DNA_Dataset"
-    INPUT_FILE = os.path.join(DATASET_DIR, "newgenomic.fna")
+    INPUT_FILE = os.path.join(DATASET_DIR, "human.txt")
     OUTPUT_FILE = "raw.txt"
     
     process_dna_half_size(INPUT_FILE, OUTPUT_FILE)

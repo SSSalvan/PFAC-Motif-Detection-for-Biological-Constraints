@@ -83,9 +83,11 @@ int main(int argc, char *argv[]) {
     // Load biological constraints
     const char *motifs[] = {
         "AAAAAA", "CCCCCC", "GGGGGG", "TTTTTT", 
-        "CGCGCG", "ATATAT"
+        "ATATAT", "TATATA", "CGCGCG", "GCGCGC",
+        "GCGCGCGC", "ATATATATAT",
+        "AAGAAG", "CAGCAG", "TGCTGC"
     };
-    int numMotifs = 6;
+    int numMotifs = 13;
 
     AhoCorasick *ac = (AhoCorasick *)malloc(sizeof(AhoCorasick));
     memset(ac->delta, -1, sizeof(ac->delta));

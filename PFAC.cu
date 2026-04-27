@@ -110,6 +110,8 @@ __global__ void pfacKernel(const char *text, int n, const int *delta, const unsi
         // INTI DARI PFAC: Thread langsung mati (break) jika transisi bernilai -1 (tidak cocok)
         if (state == -1) break; 
         
+        // Match detection: PFAC standard implementation counts at most one match 
+        // per starting position for maximum performance.
         if (output[state] != 0) {
             atomicAdd(matchCount, 1);
             break; 
@@ -122,20 +124,28 @@ int main(int argc, char *argv[]) {
     if (argc > 1) input_file = argv[1];
 
     const char *motifs[] = {
-        "AAAAAA", "CCCCCC", "GGGGGG", "TTTTTT", 
-        "CGCGCG", "ATATAT"
+        "CCCG",       // CTCF Core
+                  // CpG Dinucleotide
+        "GAATTC",     // EcoRI Restriction Site
+        "GGATCC",     // BamHI Restriction Site
+        "AAAAA",      // Poly-A Hazard (Length 5)
+        "CCCCC",      // Poly-C Hazard (Length 5)
+        "GGGGG",      // Poly-G Hazard (Length 5)
+        "TTTTT",      // Poly-T Hazard (Length 5)
+        "TGAGTCA",    // Gcn4 Consensus
+        "TGACTCA"     // Gcn4 Variation
     };
-    int numMotifs = 6;
+    int numMotifs = 9;
 
     AhoCorasick *ac = (AhoCorasick *)malloc(sizeof(AhoCorasick));
-    memset(ac->delta, -1, sizeof(ac->delta));
+    memset(ac->delta, -1, sizeof(ac->delta));   
     memset(ac->O, 0, sizeof(ac->O));
     ac->numStates = 1;
 
     for (int i = 0; i < numMotifs; i++) {
         insertPattern(ac, motifs[i], i);
-    }
-    // buildFailurelessTable(ac); // MATIKAN: GPU (PFAC) secara murni cukup menggunakan bentuk Trie, tanpa sirkulasi kegagalan.
+    }   
+    buildFailurelessTable(ac); // WAJIB: GPU (PFAC) membutuhkan transisi yang sudah "dibake" ke dalam tabel delta.
 
     // Read DNA sequence from file
     FILE *f = fopen(input_file, "r");
