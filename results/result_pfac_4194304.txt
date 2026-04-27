@@ -1,0 +1,39 @@
+========================================================
+  Parallel Failure-less AC (PFAC) -- GPU Kernel
+  Gagniuc et al., Algorithms 2025, 18, 742
+========================================================
+
+[PFAC-Build] Loading 21 motifs...
+[PFAC-Build] States: 91
+
+[INFO] File dummy.txt not found. Generating 4194304 random bases (Research Guide Mode)...
+[PFAC] Scanning 4194304 bases on GPU...
+
+[Results]
+  Total matches : 4194164
+  Kernel time   : 9.8488 ms
+  Throughput    : 0.43 GB/s
+
+  Motif                         Count
+  ----------------------------  -----
+  HOMOPOLYMER_A4                839460
+  HOMOPOLYMER_C4                798704
+  HOMOPOLYMER_G4                820720
+  HOMOPOLYMER_T4                823280
+  ECORI_GAATTC                  76832
+  BAMHI_GGATCC                  57040
+  HINDIII_AAGCTT                56992
+  XHOI_CTCGAG                   79328
+  SALI_GTCGAC                   57040
+  NCOI_CCATGG                   71056
+  NDEI_CATATG                   78928
+  SPHI_GCATGC                   59376
+  REPEAT_ATATAT                 42656
+  REPEAT_TATATA                 60416
+  REPEAT_CGCGCG                 51120
+  REPEAT_GCGCGC                 41664
+  STR_AAGAAG                    58016
+  STR_CAGCAG                    66816
+  STR_TGCTGC                    54720
+
+[Done] PFAC GPU scan complete.

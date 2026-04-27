@@ -1,0 +1,39 @@
+========================================================
+  Sequential Aho-Corasick (AC) -- CPU Baseline
+  Gagniuc et al., Algorithms 2025, 18, 742
+========================================================
+
+[AC-Build] Loading 21 motifs...
+[AC-Build] States: 91
+
+[INFO] File dummy.txt not found. Generating 65536 random bases (Research Guide Mode)...
+[AC] Scanning 65536 bases...
+
+[Results]
+  Total matches : 1203
+  CPU time      : 1.2452 ms
+  Throughput    : 0.0526 GB/s
+
+  Motif                         Count
+  ----------------------------  -----
+  HOMOPOLYMER_A4                239
+  HOMOPOLYMER_C4                238
+  HOMOPOLYMER_G4                252
+  HOMOPOLYMER_T4                245
+  ECORI_GAATTC                  18
+  BAMHI_GGATCC                  10
+  HINDIII_AAGCTT                17
+  XHOI_CTCGAG                   15
+  SALI_GTCGAC                   11
+  NCOI_CCATGG                   25
+  NDEI_CATATG                   14
+  SPHI_GCATGC                   9
+  REPEAT_ATATAT                 17
+  REPEAT_TATATA                 16
+  REPEAT_CGCGCG                 18
+  REPEAT_GCGCGC                 11
+  STR_AAGAAG                    17
+  STR_CAGCAG                    17
+  STR_TGCTGC                    14
+
+[Done] AC CPU scan complete.
