@@ -225,14 +225,13 @@ __global__ void ac_kernel(
     if (end > text_len) end = text_len;
 
     int state = 0;
-    long long local_matches = 0;
+    unsigned long long local_matches = 0;
 
     /* AC-Search (Algorithm 1 — Search phase): single-pass traversal */
     for (long long i = start; i < end; i++) {
         int a = dna_char(text[i]);
         if (a < 0) { state = 0; continue; }
 
-        /* δ(state, a) — pre-computed complete transition table (no failure loop) */
         state = go_table[state * ALPHA + a];
 
         if (out_table[state] != -1)
@@ -240,7 +239,7 @@ __global__ void ac_kernel(
     }
 
     if (local_matches > 0)
-        atomicAdd((unsigned long long*)match_count, (unsigned long long)local_matches);
+        atomicAdd(match_count, local_matches);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
