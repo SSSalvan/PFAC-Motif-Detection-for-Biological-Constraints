@@ -9,8 +9,10 @@
  *
  * Dataset:
  *   DNA sequences from human / chimpanzee / dog gene classification dataset.
- *   Files: DNA_Dataset/human.txt, chimpanzee.txt, dog.txt  (TSV: seq\tclass)
- *          DNA_Dataset/example_dna.fa  (FASTA format)
+ *   Files: data/genomic/knownCanonical.exonNuc.fa  (Human hg38 exons)
+ *          data/genomic/CHM13v2.0_genomic.fna      (Human T2T genome)
+ *          data/genomic/dmel-all-aligned-r6.66.fasta (D. melanogaster)
+ *          data/genomic/cere/strains/S288c/assembly/genome.fa (Yeast)
  *
  * Comparison Metrics  : Execution Time, Throughput, SpeedUp, Memory Usage,
  *                       Accuracy, Scalability
@@ -76,11 +78,16 @@
 #define WARP_SIZE         32
 #define THREADS_PER_BLOCK 256
 
-/* Dataset paths - edit if your folder layout differs */
-#define PATH_HUMAN  "DNA_Dataset/human.txt"
-#define PATH_CHIMP  "DNA_Dataset/chimpanzee.txt"
-#define PATH_DOG    "DNA_Dataset/dog.txt"
-#define PATH_FASTA  "DNA_Dataset/example_dna.fa"
+/* Dataset paths - relative to where pfac_ac.exe is run from
+   1. Human exon sequences       (knownCanonical, hg38)
+   2. Human T2T complete genome  (CHM13v2.0, capped at 64 MB)
+   3. Drosophila melanogaster    (r6.66 aligned)
+   4. S. cerevisiae S288c ref    (yeast reference)            */
+#define PATH_EXON  "data/genomic/knownCanonical.exonNuc.fa/knownCanonical.exonNuc.fa"
+#define PATH_CHM13 "data/genomic/CHM13v2.0_genomic.fna/CHM13v2.0_genomic.fna"
+#define PATH_DMEL  "data/genomic/dmel-all-aligned-r6.66.fasta/dmel-all-aligned-r6.66.fasta"
+#define PATH_YEAST "data/genomic/cere/strains/S288c/assembly/genome.fa"
+#define CHM13_CAP_MB 64UL  /* cap heavy file; set 0 for full load */
 
 /* CUDA error check */
 #define CUDA_CHECK(call)                                                       \
@@ -109,75 +116,47 @@ typedef struct { int n_patterns; size_t input_size; double cpu_ms, gpu_ms, speed
  * PART 1 - DNA DATASET LOADER
  * ========================================================================= */
 
-static uint8_t *load_tsv_dna(const char *path, size_t *out_len,
-                               uint8_t pats[][MAX_PATTERN_LEN], int *pat_lens,
-                               int *n_pats, int max_pats, int kmer_len)
+/* load_fasta: reads FASTA file stripping headers and newlines.
+   cap_bytes: stop after collecting this many sequence bytes (0 = no cap) */
+static uint8_t *load_fasta_capped(const char *path, size_t *out_len, size_t cap_bytes)
 {
-    FILE *f = fopen(path, "r");
-    if(!f){ fprintf(stderr,"[WARN] Cannot open %s\n",path); *out_len=0; return NULL; }
-
-    size_t total = 0;
-    char line[65536];
-    fgets(line, sizeof(line), f); /* skip header */
-    while(fgets(line, sizeof(line), f)){
-        char *tab = strchr(line, '\t');
-        if(!tab) continue;
-        total += (size_t)(tab - line);
+    FILE *f = fopen(path,"r");
+    if(!f){
+        fprintf(stderr,"[WARN] Cannot open: %s\n", path);
+        *out_len=0; return NULL;
     }
+    /* measure file size for allocation (seek to end) */
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
     rewind(f);
-    fgets(line, sizeof(line), f); /* skip header again */
-
-    uint8_t *buf = (uint8_t*)malloc(total + 1);
-    if(!buf){ fclose(f); *out_len=0; return NULL; }
-
-    size_t pos = 0;
-    int    collected = *n_pats;
-    int    row = 0;
-
-    while(fgets(line, sizeof(line), f)){
-        char *p = line;
-        while(*p && *p != '\t') p++;
-        if(*p != '\t') continue;
-        *p = '\0';
-        size_t slen = (size_t)(p - line);
-
-        for(size_t i=0; i<slen; i++)
-            buf[pos++] = (uint8_t)toupper((unsigned char)line[i]);
-
-        /* sample one k-mer every ~8 rows */
-        if(collected < max_pats && slen >= (size_t)kmer_len && (row % 8)==0){
-            size_t start = slen / 3;
-            if(start + kmer_len <= slen){
-                memcpy(pats[collected], (uint8_t*)line + start, kmer_len);
-                pat_lens[collected] = kmer_len;
-                collected++;
-            }
-        }
-        row++;
+    size_t alloc = (cap_bytes > 0 && (size_t)fsz > cap_bytes)
+                 ? cap_bytes + 4096
+                 : (size_t)fsz + 4096;
+    uint8_t *buf = (uint8_t*)malloc(alloc + 1);
+    if(!buf){
+        fprintf(stderr,"[ERROR] malloc failed for %s (%zu MB)\n",
+                path, alloc/1024/1024);
+        fclose(f); *out_len=0; return NULL;
     }
+    size_t pos = 0;
+    char line[8192];
+    while(fgets(line, sizeof(line), f)){
+        if(line[0]=='>') continue;
+        for(int i=0; line[i] && line[i]!='\n' && line[i]!='\r'; i++){
+            if(cap_bytes > 0 && pos >= cap_bytes) goto done;
+            buf[pos++] = (uint8_t)toupper((unsigned char)line[i]);
+        }
+    }
+done:
     fclose(f);
-    *out_len = pos;
-    *n_pats  = collected;
     buf[pos] = '\0';
+    *out_len = pos;
     return buf;
 }
 
-static uint8_t *load_fasta(const char *path, size_t *out_len)
-{
-    FILE *f = fopen(path,"r");
-    if(!f){ *out_len=0; return NULL; }
-    fseek(f,0,SEEK_END); long fsz=ftell(f); rewind(f);
-    uint8_t *buf=(uint8_t*)malloc(fsz+1);
-    size_t pos=0;
-    char line[4096];
-    while(fgets(line,sizeof(line),f)){
-        if(line[0]=='>') continue;
-        for(int i=0; line[i]&&line[i]!='\n'&&line[i]!='\r'; i++)
-            buf[pos++]=(uint8_t)toupper((unsigned char)line[i]);
-    }
-    fclose(f);
-    buf[pos]='\0'; *out_len=pos;
-    return buf;
+/* Convenience wrapper — no cap */
+static uint8_t *load_fasta(const char *path, size_t *out_len){
+    return load_fasta_capped(path, out_len, 0);
 }
 
 /* =========================================================================
@@ -474,41 +453,71 @@ int main(void)
     CUDA_CHECK(cudaGetDeviceProperties(&dp,0));
     printf("GPU: %s  (Compute %d.%d)\n\n",dp.name,dp.major,dp.minor); fflush(stdout);
 
-    /* Load datasets */
-    printf("Loading DNA datasets...\n"); fflush(stdout);
-    int    n_pats=0;
-    size_t human_len=0, chimp_len=0, dog_len=0, fa_len=0;
+    /* Load genomic FASTA datasets */
+    printf("Loading genomic FASTA datasets...\n"); fflush(stdout);
 
-    uint8_t *human_data = load_tsv_dna(PATH_HUMAN,&human_len,g_pats,g_plens,&n_pats,MAX_PATTERNS/2,MAX_PATTERN_LEN);
-    uint8_t *chimp_data = load_tsv_dna(PATH_CHIMP,&chimp_len,g_pats,g_plens,&n_pats,MAX_PATTERNS*3/4,MAX_PATTERN_LEN);
-    uint8_t *dog_data   = load_tsv_dna(PATH_DOG,  &dog_len,  g_pats,g_plens,&n_pats,MAX_PATTERNS,MAX_PATTERN_LEN);
-    uint8_t *fa_data    = load_fasta(PATH_FASTA,&fa_len);
+    int    n_pats = 0;
+    size_t exon_len=0, chm13_len=0, dmel_len=0, yeast_len=0;
 
-    size_t total_input = human_len+chimp_len+dog_len+fa_len;
-    if(total_input==0){
+    /* Load each FASTA file */
+    printf("  [1/4] Reading human exons (hg38, capped at 64 MB)...\n"); fflush(stdout);
+    uint8_t *exon_data  = load_fasta_capped(PATH_EXON,  &exon_len,  64UL*1024*1024);
+    printf("        -> %.3f MB\n", (double)exon_len/1e6); fflush(stdout);
+
+    printf("  [2/4] Reading Human T2T CHM13 (capped at %lu MB)...\n", CHM13_CAP_MB); fflush(stdout);
+    uint8_t *chm13_data = load_fasta_capped(PATH_CHM13, &chm13_len, CHM13_CAP_MB*1024*1024);
+    printf("        -> %.3f MB\n", (double)chm13_len/1e6); fflush(stdout);
+
+    printf("  [3/4] Reading D. melanogaster r6.66 (capped at 64 MB)...\n"); fflush(stdout);
+    uint8_t *dmel_data  = load_fasta_capped(PATH_DMEL,  &dmel_len,  64UL*1024*1024);
+    printf("        -> %.3f MB\n", (double)dmel_len/1e6); fflush(stdout);
+
+    printf("  [4/4] Reading S. cerevisiae S288c...\n"); fflush(stdout);
+    uint8_t *yeast_data = load_fasta(PATH_YEAST, &yeast_len);
+    printf("        -> %.3f MB\n", (double)yeast_len/1e6); fflush(stdout);
+
+    size_t total_input = exon_len + chm13_len + dmel_len + yeast_len;
+    if(total_input == 0){
         fprintf(stderr,
-            "\n[ERROR] No data loaded.\n"
-            "  Make sure DNA_Dataset\\ folder is in the same directory as pfac_ac.exe\n"
-            "  and contains: human.txt  chimpanzee.txt  dog.txt  example_dna.fa\n\n");
+            "\n[ERROR] No data loaded. Check these paths exist:\n"
+            "  %s\n  %s\n  %s\n  %s\n\n",
+            PATH_EXON, PATH_CHM13, PATH_DMEL, PATH_YEAST);
         return 1;
     }
 
-    uint8_t *h_data=(uint8_t*)malloc(total_input+1);
-    size_t wpos=0;
-    if(human_data){memcpy(h_data+wpos,human_data,human_len);wpos+=human_len;free(human_data);}
-    if(chimp_data){memcpy(h_data+wpos,chimp_data,chimp_len);wpos+=chimp_len;free(chimp_data);}
-    if(dog_data)  {memcpy(h_data+wpos,dog_data,  dog_len);  wpos+=dog_len;  free(dog_data);  }
-    if(fa_data)   {memcpy(h_data+wpos,fa_data,   fa_len);   wpos+=fa_len;   free(fa_data);   }
-    h_data[wpos]='\0';
+    /* Concatenate into one stream */
+    uint8_t *h_data = (uint8_t*)malloc(total_input + 1);
+    size_t wpos = 0;
+    if(exon_data) { memcpy(h_data+wpos, exon_data,  exon_len);  wpos+=exon_len;  free(exon_data);  }
+    if(chm13_data){ memcpy(h_data+wpos, chm13_data, chm13_len); wpos+=chm13_len; free(chm13_data); }
+    if(dmel_data) { memcpy(h_data+wpos, dmel_data,  dmel_len);  wpos+=dmel_len;  free(dmel_data);  }
+    if(yeast_data){ memcpy(h_data+wpos, yeast_data, yeast_len); wpos+=yeast_len; free(yeast_data); }
+    h_data[wpos] = '\0';
 
-    if(n_pats==0){fprintf(stderr,"[ERROR] No motifs extracted.\n");free(h_data);return 1;}
+    /* Extract k-mer motifs from the concatenated stream */
+    /* Sample one k-mer every KMER_STRIDE bytes           */
+    const int KMER_STRIDE = (int)(total_input / MAX_PATTERNS) + 1;
+    for(size_t i=0; i<total_input-(size_t)MAX_PATTERN_LEN && n_pats<MAX_PATTERNS; i+=KMER_STRIDE){
+        /* skip Ns */
+        int ok = 1;
+        for(int j=0;j<MAX_PATTERN_LEN;j++)
+            if(h_data[i+j]=='N'||h_data[i+j]=='n'||h_data[i+j]==0){ok=0;break;}
+        if(ok){
+            memcpy(g_pats[n_pats], h_data+i, MAX_PATTERN_LEN);
+            g_plens[n_pats] = MAX_PATTERN_LEN;
+            n_pats++;
+        }
+    }
 
-    printf("  Human sequences  : %.3f MB\n",(double)human_len/1e6);
-    printf("  Chimp sequences  : %.3f MB\n",(double)chimp_len/1e6);
-    printf("  Dog sequences    : %.3f MB\n",(double)dog_len/1e6);
-    printf("  FASTA sequences  : %.3f MB\n",(double)fa_len/1e6);
-    printf("  Total input      : %.3f MB\n",(double)total_input/1e6);
-    printf("  Motifs extracted : %d  (k=%d nt)\n\n",n_pats,MAX_PATTERN_LEN); fflush(stdout);
+    if(n_pats == 0){fprintf(stderr,"[ERROR] No motifs extracted.\n");free(h_data);return 1;}
+
+    printf("  Human exons (hg38)    : %.3f MB\n", (double)exon_len/1e6);
+    printf("  Human T2T CHM13 (cap) : %.3f MB\n", (double)chm13_len/1e6);
+    printf("  D. melanogaster r6.66 : %.3f MB\n", (double)dmel_len/1e6);
+    printf("  S. cerevisiae S288c   : %.3f MB\n", (double)yeast_len/1e6);
+    printf("  Total input stream    : %.3f MB\n", (double)total_input/1e6);
+    printf("  Motifs extracted      : %d  (k=%d nt, stride=%d)\n\n",
+           n_pats, MAX_PATTERN_LEN, KMER_STRIDE); fflush(stdout);
 
     /* Build automaton */
     printf("Building Aho-Corasick automaton...\n"); fflush(stdout);
@@ -587,8 +596,9 @@ int main(void)
     ac_build_failure();
 
     char desc[256];
-    snprintf(desc,sizeof(desc),"Human/Chimp/Dog DNA (%.2f MB) | %d k-mer motifs (k=%d)",
-             (double)total_input/1e6,n_pats,MAX_PATTERN_LEN);
+    snprintf(desc,sizeof(desc),
+             "hg38 exons + CHM13 + D.mel r6.66 + S.cer S288c (%.2f MB) | %d k-mer motifs (k=%d)",
+             (double)total_input/1e6, n_pats, MAX_PATTERN_LEN);
     print_report(&cpu_res,&gpu_res,acc,scale_pts,N_SCALE,n_pats,total_input,&dp,desc);
 
     free(h_data);
