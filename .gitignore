@@ -1,0 +1,26 @@
+# --- DATASET & LARGE FILES ---
+data/
+Datasets/
+
+*.gz
+*.tar.gz
+*.fna
+*.fasta
+*.crdownload
+
+# --- COMPILED BINARIES (CUDA/C++) ---
+bin/
+
+# File objek dan executable hasil kompilasi
+*.exe
+*.o
+*.obj
+*.out
+
+# --- IDE & SYSTEM ---
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- HASIL RISET ---
+results/
