@@ -146,17 +146,24 @@ static int ac_new(void){
     g_nodes[id].fail=0; g_nodes[id].out=-1; g_nodes[id].depth=0;
     return id;
 }
-static void ac_insert(const uint8_t *p,int len,int pid){
-    int cur=0;
-    for(int i=0;i<len;i++){
-        int c=p[i];
-        if(g_nodes[cur].next[c]==-1){
-            int n=ac_new(); g_nodes[n].depth=g_nodes[cur].depth+1;
-            g_nodes[cur].next[c]=n;
+static void ac_insert(const uint8_t *p, int len, int pid){
+    int cur = 0;
+    for(int i = 0; i < len; i++){
+        int c = (int)p[i];
+        if(c == 0xFF) continue;           // non-DNA
+        if(c >= 4){                       // still ASCII? convert
+            c = dna_enc((uint8_t)c);
+            if(c < 0) continue;
         }
-        cur=g_nodes[cur].next[c];
+        // c is now guaranteed 0-3
+        if(g_nodes[cur].next[c] == -1){
+            int n = ac_new();
+            g_nodes[n].depth = g_nodes[cur].depth + 1;
+            g_nodes[cur].next[c] = n;
+        }
+        cur = g_nodes[cur].next[c];
     }
-    g_nodes[cur].out=pid;
+    g_nodes[cur].out = pid;
 }
 static void ac_build(void){
     static int q[MAX_STATES]; int h=0,t=0;

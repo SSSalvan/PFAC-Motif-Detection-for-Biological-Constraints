@@ -1,0 +1,122 @@
+========================================================================
+  PFAC GPU  —  Two-Phase PFAC (caveman edition)
+  Ref: Lin et al., IEEE TPDS 2023 [Ref 10]
+========================================================================
+
+Initializing CUDA...
+  GPU: NVIDIA GeForce RTX 4070 Laptop GPU (Compute 8.9, 36 SMs, 8.6 GB)
+
+Loading FASTA datasets (cap: 256 MB each)...
+  [1/4] Human exons (hg38)    ... 257.657 MB
+  [2/4] Human T2T CHM13       ... 268.435 MB
+  [3/4] D. melanogaster r6.66 ... 268.435 MB
+  [4/4] S. cerevisiae S288c   ... [WARN] States (7100) > CONST_MEM_MAX_STATES (2048): using global memory.
+12.328 MB
+
+  Total input : 806.856 MB
+  Motifs      : 497 (k=18 nt, stride=1575892)
+
+Building AC trie + failure links...
+  States: 7100  |  PFAC table: 110 KB (global memory)
+
+GPU warm-up...
+Measuring CPU AC reference time...
+  CPU AC: 196327 matches in 6303.960 ms
+
+Running Two-Phase PFAC scan...
+[WARN] States (7100) > CONST_MEM_MAX_STATES (2048): using global memory.
+  Done: 196327 matches in 193.246 ms wall / 71.485 ms kernel  (11287.00 MB/s)
+  Kernel: Phase1=32.485ms  Phase2=39.000ms  Total=71.485ms
+
+Scalability sweep (5 points, CPU + GPU each)...
+  [1/5]  49 motifs x 40.34 MB : CPU=206.820ms  GPU=10.129ms  20.42x
+  [2/5] 124 motifs x 121.03 MB : CPU=717.445ms  GPU=72.333ms  9.92x
+[WARN] States (3665) > CONST_MEM_MAX_STATES (2048): using global memory.
+  [3/5] 248 motifs x 242.06 MB : CPU=1531.166ms  GPU=12.622ms  121.31x
+[WARN] States (5386) > CONST_MEM_MAX_STATES (2048): using global memory.
+  [4/5] 372 motifs x 484.11 MB : CPU=3571.745ms  GPU=40.426ms  88.35x
+[WARN] States (7100) > CONST_MEM_MAX_STATES (2048): using global memory.
+  [5/5] 497 motifs x 806.86 MB : CPU=6252.316ms  GPU=71.500ms  87.45x
+
+========================================================================
+  PFAC GPU — BENCHMARK RESULTS
+  Ref: Lin et al., IEEE TPDS 2023 (Two-Phase PFAC) [Ref 10]
+========================================================================
+
+  GPU         : NVIDIA GeForce RTX 4070 Laptop GPU  (Compute 8.9, 36 SMs, 8.6 GB)
+  Algorithm   : Two-Phase PFAC (Phase1=Filter, Phase2=Verify)
+  Alphabet    : DNA 4-symbol {A,C,G,T}
+  Table       : 7100 states x 4 x 4B = 110 KB (global memory)
+  Patterns    : 497 k-mers (k=18 nt)  |  AC States: 7100
+  Input       : 806.856 MB (806856265 bytes)
+
+------------------------------------------------------------------------
+  COMPARISON METRICS  (compare with ac_baseline output)
+------------------------------------------------------------------------
+  1a. Execution Time (wall)                 193.246 ms
+  1b. Execution Time (kernel)                71.485 ms
+  2. Throughput (kernel time)              11287.00 MB/s
+  3. SpeedUp (kernel vs CPU AC)               88.19x
+     CPU AC reference               :  6303.960 ms
+  4. Memory Usage (GPU)                     1141.02 MB
+  5. Matches Found                           196327
+     Accuracy note                  :  PFAC finds overlapping hits (see Notes)
+
+  6. Scalability (GPU kernel time vs CPU AC on same subset):
+     Motifs    Input(MB)        CPU(ms)     GPU(ms)     Throughput   SpeedUp
+     49        40.343           206.820      10.129   3982.7 MB/s    20.42x
+     124       121.028          717.445      72.333   1673.2 MB/s     9.92x
+     248       242.057         1531.166      12.622  19177.6 MB/s   121.31x
+     372       484.114         3571.745      40.426  11975.2 MB/s    88.35x
+     497       806.856         6252.316      71.500  11284.7 MB/s    87.45x
+
+------------------------------------------------------------------------
+  PROFILING METRICS  (Two-Phase PFAC Kernel)
+------------------------------------------------------------------------
+  1. Kernel Time - Phase 1 (Filter)          32.485 ms
+     Kernel Time - Phase 2 (Verify)          39.000 ms
+     Kernel Time - Total                     71.485 ms
+  2. Occupancy (CUDA API)                    100.0 %
+  3. Warp Efficiency                     run ncu *
+  4. Branch Divergence                   run ncu *
+  5. Memory Throughput                   run ncu *
+  * Use ncu command below for real paper-ready values.
+
+------------------------------------------------------------------------
+  REAL PROFILING COMMAND (run this for paper metrics):
+------------------------------------------------------------------------
+  Linux:
+    ncu --metrics \
+      sm__warps_active.avg.pct_of_peak_sustained_active,\
+      smsp__sass_average_branch_targets_threads_uniform.pct,\
+      l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,\
+      sm__cycles_active.avg.pct_of_peak_sustained_elapsed \
+      ./pfac_gpu > ncu_report.txt
+
+  Windows:
+    ncu --metrics ^
+      sm__warps_active.avg.pct_of_peak_sustained_active,^
+      smsp__sass_average_branch_targets_threads_uniform.pct,^
+      l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,^
+      sm__cycles_active.avg.pct_of_peak_sustained_elapsed ^
+      pfac_gpu.exe > ncu_report.txt
+
+  ncu metric -> paper metric mapping:
+    sm__warps_active.*pct              -> Warp Efficiency
+    *branch_targets*uniform.pct        -> 100% - value = Branch Div.
+    l1tex__t_bytes*global*ld / time    -> Memory Throughput
+    sm__cycles_active.*pct             -> Occupancy
+
+------------------------------------------------------------------------
+  NOTES
+------------------------------------------------------------------------
+  * PFAC: one thread per input position, pure trie traversal.
+  * No failure links in kernel — failure-link-free is the point.
+  * Phase 1 exits early if depth < 6 — most threads die here.
+  * Phase 2 only runs for positions that passed phase 1.
+  * PFAC match count can differ from AC: overlapping matches
+    are both correct. Compare pattern IDs, not position counts.
+  * SpeedUp = CPU AC wall time / GPU kernel time only.
+    H2D/D2H transfer excluded for fair algorithmic comparison.
+========================================================================
+

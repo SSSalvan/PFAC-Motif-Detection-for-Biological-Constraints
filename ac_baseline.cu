@@ -58,7 +58,7 @@
 #define DNA_ALPHA    4        /* {A=0, C=1, G=2, T=3}                        */
 #define MAX_PATS   512
 #define MAX_PAT_LEN 18        /* k-mer length                                 */
-#define MAX_STATES (MAX_PATS * MAX_PAT_LEN + 2)
+#define MAX_STATES (MAX_PATS * MAX_PAT_LEN * 3 + 2000)
 #define MAX_MATCHES (1 << 23)
 
 /* Dataset paths */
@@ -66,7 +66,7 @@
 #define PATH_CHM13  "data/genomic/CHM13v2.0_genomic.fna/CHM13v2.0_genomic.fna"
 #define PATH_DMEL   "data/genomic/dmel-all-aligned-r6.66.fasta/dmel-all-aligned-r6.66.fasta"
 #define PATH_YEAST  "data/genomic/cere/strains/S288c/assembly/genome.fa"
-#define CAP_MB       64UL
+#define CAP_MB       512UL
 
 /* ── DNA encoder ── */
 static inline int dna_enc(uint8_t c){
@@ -156,7 +156,12 @@ static int ac_new(void){
 static void ac_insert(const uint8_t *p, int len, int pid){
     int cur=0;
     for(int i=0;i<len;i++){
-        int c=dna_enc(p[i]); if(c<0) continue;
+        int c = (int)p[i];
+        if(c == 0xFF) continue;                    /* non-DNA */
+        if(c >= 4){                                /* still ASCII? */
+            c = dna_enc((uint8_t)c);
+            if(c < 0) continue;
+        }
         if(g_nodes[cur].next[c]==-1){
             int n=ac_new();
             g_nodes[n].depth=g_nodes[cur].depth+1;
@@ -301,11 +306,16 @@ int main(void)
 
     /* Extract k-mer motifs */
     int stride=(int)(total/MAX_PATS)+1;
+    g_np = 0;
     for(size_t i=0; i<total-(size_t)MAX_PAT_LEN && g_np<MAX_PATS; i+=stride){
         int ok=1;
         for(int j=0;j<MAX_PAT_LEN;j++)
             if(hdata[i+j]==0xFF){ok=0;break;}
-        if(ok){ memcpy(g_pats[g_np],hdata+i,MAX_PAT_LEN); g_pl[g_np]=MAX_PAT_LEN; g_np++; }
+        if(ok){ 
+            memcpy(g_pats[g_np],hdata+i,MAX_PAT_LEN); 
+            g_pl[g_np]=MAX_PAT_LEN; 
+            g_np++; 
+        }
     }
     printf("  Total input : %.3f MB\n", (double)total/1e6);
     printf("  Motifs      : %d (k=%d nt, stride=%d)\n\n", g_np, MAX_PAT_LEN, stride);

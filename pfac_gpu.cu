@@ -1,106 +1,160 @@
 /**
  * ============================================================================
- * pfac_gpu.cu — Two-Phase PFAC GPU Implementation
+ * pfac_gpu.cu  —  Two-Phase PFAC, caveman edition
  * ============================================================================
- * Paper : "String Matching Performance and Scalability Analysis of
- *          Aho-Corasick and PFAC Algorithms on CUDA GPUs for DNA Sequences"
+ * Paper : Lin et al., "Two-Phase PFAC Algorithm for Multiple Patterns
+ *         Matching on CUDA," IEEE TPDS 2023.  [Ref 10]
  *
- * PFAC Baseline Reference:
- *   Lin, C.-H. et al., "Two-Phase PFAC Algorithm for Multiple Patterns
- *   Matching on CUDA," IEEE Transactions on Parallel and Distributed
- *   Systems, 2023. [Ref 10]
+ * CAVEMAN RULES:
+ *   1. One thing per function. Function does exactly what its name says.
+ *   2. No clever macros that hide what's happening.
+ *   3. Every kernel parameter is spelled out — no pointer aliasing tricks.
+ *   4. Memory path is explicit: build table → copy to GPU → run kernel.
+ *   5. Timing is honest: wall time = wall, kernel time = kernel.
+ *   6. If states > constant memory limit, we say so and use global. Done.
  *
- * Algorithm — Two-Phase PFAC (Lin et al. 2023):
- *   Phase 1 (Filter):
- *     One GPU thread per input byte. Each thread walks the PURE TRIE
- *     (no failure links) from its start position for at most MAX_PAT_LEN
- *     steps. If it reaches depth >= MIN_DEPTH without hitting an undefined
- *     transition, it flags itself as a candidate (d_flag[tid]=1).
- *     Most threads abort at step 1 — only pattern prefixes survive.
+ * Build (Linux / WSL):
+ *   nvcc -O3 -arch=sm_89 pfac_gpu.cu -o pfac_gpu
  *
- *   Phase 2 (Verify):
- *     Only flagged threads re-walk the trie to confirm a terminal state.
- *     If confirmed, writes a match record atomically.
+ * Build (Windows, MSVC mismatch):
+ *   nvcc -O3 -arch=sm_89 --allow-unsupported-compiler pfac_gpu.cu -o pfac_gpu.exe
  *
- *   Key properties:
- *     - Failure-link free → no inter-thread dependencies → full GPU parallelism
- *     - Two-phase → Phase 1 is cheap for the vast majority of threads
- *     - One thread per byte → deterministic coalesced input reads via __ldg()
- *
- * Memory optimizations (addresses global memory thrashing):
- *   1. DNA-compressed alphabet: 4-wide table instead of 256-wide
- *      → table shrinks from ~512 KB to ~8 KB → fits in __constant__ memory
- *   2. __constant__ memory for automaton table → broadcast to all threads
- *   3. __ldg() for input stream → read-only L1 texture cache path
- *
- * Profiling metrics:
- *   - Kernel Time  : cudaEventElapsedTime (Phase1 + Phase2 separately)
- *   - Occupancy    : cudaOccupancyMaxActiveBlocksPerMultiprocessor (API)
- *   - Warp Eff.    : analytical estimate from thread/warp counts
- *   - Branch Div.  : analytical estimate from candidate rate
- *   - Mem Throughput: bytes accessed / kernel time
- *   NOTE: For publication, replace (est.) values with ncu output — see below.
- *
- * Build:
- *   nvcc -O3 -arch=sm_89 --allow-unsupported-compiler pfac_gpu.cu -o pfac_gpu
- *   pfac_gpu.exe
- *
- * Hardware profiling (for paper — run after compilation):
- *   ncu --metrics ^
- *     sm__warps_active.avg.pct_of_peak_sustained_active,^
- *     smsp__sass_average_branch_targets_threads_uniform.pct,^
- *     l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,^
- *     sm__cycles_active.avg.pct_of_peak_sustained_elapsed ^
- *     pfac_gpu.exe > ncu_report.txt
+ * Real profiling (run after build):
+ *   ncu --metrics \
+ *     sm__warps_active.avg.pct_of_peak_sustained_active,\
+ *     smsp__sass_average_branch_targets_threads_uniform.pct,\
+ *     l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,\
+ *     sm__cycles_active.avg.pct_of_peak_sustained_elapsed \
+ *     ./pfac_gpu > ncu_report.txt
  * ============================================================================
  */
 
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <ctype.h>
 
-/* ── Cross-platform timer ── */
+/* ── platform timer ── */
 #ifdef _WIN32
 #  include <windows.h>
-   typedef LARGE_INTEGER ts_t;
-   static LARGE_INTEGER _qpf; static int _qi=0;
-   static inline void   tnow(ts_t *t){ if(!_qi){QueryPerformanceFrequency(&_qpf);_qi=1;} QueryPerformanceCounter(t); }
-   static inline double tsec(ts_t *a,ts_t *b){ return (double)(b->QuadPart-a->QuadPart)/(double)_qpf.QuadPart; }
+   static LARGE_INTEGER _freq;
+   static int           _freq_ok = 0;
+   typedef LARGE_INTEGER hrtimer_t;
+   static void hrtimer_now(hrtimer_t *t) {
+       if (!_freq_ok) { QueryPerformanceFrequency(&_freq); _freq_ok = 1; }
+       QueryPerformanceCounter(t);
+   }
+   static double hrtimer_ms(hrtimer_t *a, hrtimer_t *b) {
+       return (double)(b->QuadPart - a->QuadPart) /
+              (double)_freq.QuadPart * 1000.0;
+   }
 #else
 #  include <time.h>
-   typedef struct timespec ts_t;
-   static inline void   tnow(ts_t *t){ clock_gettime(CLOCK_MONOTONIC,t); }
-   static inline double tsec(ts_t *a,ts_t *b){ return (b->tv_sec-a->tv_sec)+(b->tv_nsec-a->tv_nsec)*1e-9; }
+   typedef struct timespec hrtimer_t;
+   static void hrtimer_now(hrtimer_t *t) { clock_gettime(CLOCK_MONOTONIC, t); }
+   static double hrtimer_ms(hrtimer_t *a, hrtimer_t *b) {
+       return (b->tv_sec  - a->tv_sec ) * 1000.0 +
+              (b->tv_nsec - a->tv_nsec) / 1e6;
+   }
 #endif
 
-/* ── Constants ── */
-#define DNA_ALPHA    4        /* {A=0, C=1, G=2, T=3}                         */
-#define MAX_PATS   512
-#define MAX_PAT_LEN 18        /* k-mer length                                  */
-#define MIN_DEPTH    4        /* Phase-1 filter threshold                      */
-#define MAX_STATES 2048       /* 2048 × (4+1+1) × 4B = 48 KB < 64 KB limit    */
-#define MAX_MATCHES (1<<23)   /* 8M match slots                                */
-#define TPB        256        /* threads per block                             */
-#define WARP        32
+/* ── CUDA error check — abort on any error ── */
+#define CUDA_CHECK(call)                                                    \
+    do {                                                                    \
+        cudaError_t _err = (call);                                          \
+        if (_err != cudaSuccess) {                                          \
+            fprintf(stderr, "[CUDA ERROR] %s\n  at %s line %d\n",          \
+                    cudaGetErrorString(_err), __FILE__, __LINE__);          \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
 
-/* Dataset paths */
-#define PATH_EXON   "data/genomic/knownCanonical.exonNuc.fa/knownCanonical.exonNuc.fa"
+/* ============================================================
+ * CONSTANTS  —  all in one place, easy to change
+ * ============================================================ */
+#define DNA_ALPHA       4           /* A=0 C=1 G=2 T=3                    */
+#define MAX_PATTERNS  512           /* hard cap on number of patterns      */
+#define PAT_LEN        18           /* every k-mer is exactly 18 nt        */
+#define FILTER_DEPTH    6           /* phase-1 exits early if depth < this */
+#define MAX_STATES   8192           /* trie nodes (512 pats × 18 nt + 1)  */
+#define MAX_MATCHES (1<<23)         /* 8M slots — more than enough         */
+#define THREADS_PER_BLOCK 256
+
+/*
+ * Constant memory is 64 KB on all CUDA devices.
+ * Table size = states × DNA_ALPHA × 4 bytes.
+ * 64 KB / (4 × 4B) = 4096 states maximum.
+ * We pick 2048 to be safe (leaves room for out[] and depth[]).
+ * If automaton is bigger we fall back to global memory.
+ */
+#define CONST_MEM_MAX_STATES 2048
+#define CONST_TABLE_SIZE     (CONST_MEM_MAX_STATES * DNA_ALPHA)
+
+/* Dataset paths — edit these to match your filesystem */
+#define PATH_EXONS  "data/genomic/knownCanonical.exonNuc.fa/knownCanonical.exonNuc.fa"
 #define PATH_CHM13  "data/genomic/CHM13v2.0_genomic.fna/CHM13v2.0_genomic.fna"
 #define PATH_DMEL   "data/genomic/dmel-all-aligned-r6.66.fasta/dmel-all-aligned-r6.66.fasta"
 #define PATH_YEAST  "data/genomic/cere/strains/S288c/assembly/genome.fa"
-#define CAP_MB       64UL
+#define FASTA_CAP_MB 256UL           /* cap each file at 1 GB              */
 
-#define CUDA_CHECK(c) do{ cudaError_t _e=(c); if(_e!=cudaSuccess){ \
-    fprintf(stderr,"[CUDA] %s @ %s:%d — %s\n",#c,__FILE__,__LINE__,cudaGetErrorString(_e)); \
-    exit(1); } }while(0)
+/* ============================================================
+ * DATA TYPES
+ * ============================================================ */
+typedef struct {
+    int pos;   /* position in text where match ends */
+    int pat;   /* which pattern matched              */
+} Match;
 
-/* ── DNA encoder ── */
-static inline int dna_enc(uint8_t c){
-    switch(c){
+/*
+ * One trie node.
+ * trie_next[] = pure trie (before failure links) — used by PFAC kernel.
+ * ac_next[]   = full AC transitions (after failure links) — used by CPU scan.
+ * Both arrays are filled separately; they are NOT the same thing.
+ */
+typedef struct {
+    int trie_next[DNA_ALPHA];  /* -1 = no child in trie                  */
+    int ac_next  [DNA_ALPHA];  /* handles failure-link redirects for AC   */
+    int fail;
+    int output_pat;            /* -1 = no pattern ends here, else pat id  */
+    int depth;
+} TrieNode;
+
+/* ============================================================
+ * GLOBALS  —  automaton lives here on host
+ * ============================================================ */
+static TrieNode g_trie[MAX_STATES];
+static int      g_num_states = 0;
+
+static uint8_t  g_pats[MAX_PATTERNS][PAT_LEN];
+static int      g_pat_len[MAX_PATTERNS];
+static int      g_num_pats = 0;
+
+static Match    g_match_buf[MAX_MATCHES];   /* reused scratch buffer       */
+static Match    g_sweep_buf[MAX_MATCHES];   /* separate buf for sweep      */
+
+/* ============================================================
+ * CONSTANT MEMORY ARRAYS  (used when automaton fits)
+ * ============================================================ */
+__constant__ int d_const_table[CONST_TABLE_SIZE];
+__constant__ int d_const_out  [CONST_MEM_MAX_STATES];
+__constant__ int d_const_depth[CONST_MEM_MAX_STATES];
+
+/* Global memory fallback pointers (used when automaton is too big) */
+static int *d_glob_table = NULL;
+static int *d_glob_out   = NULL;
+static int *d_glob_depth = NULL;
+
+/* Which path are we using right now? */
+static int g_use_const_mem = 1;  /* 1 = constant, 0 = global fallback    */
+
+/* ============================================================
+ * DNA ENCODER
+ * Returns 0-3 for A/C/G/T (upper or lower case).
+ * Returns -1 for anything else (N, gaps, etc.).
+ * ============================================================ */
+static int encode_base(uint8_t c) {
+    switch (c) {
         case 'A': case 'a': return 0;
         case 'C': case 'c': return 1;
         case 'G': case 'g': return 2;
@@ -109,527 +163,932 @@ static inline int dna_enc(uint8_t c){
     }
 }
 
-/* ── Structs ── */
-typedef struct {
-    int next[DNA_ALPHA];
-    int fail; int out; int depth;
-} ACNode;
-
-typedef struct { int pos; int pat; } Match;
-
-typedef struct {
-    double exec_ms;
-    double throughput_mbps;
-    double speedup;
-    size_t mem_bytes;
-    int    matches;
-    /* profiling */
-    double phase1_ms;
-    double phase2_ms;
-    double kernel_ms;       /* phase1 + phase2                              */
-    double occupancy_pct;   /* from CUDA API                                */
-    double warp_eff_pct;    /* analytical                                   */
-    double branch_div_pct;  /* analytical                                   */
-    double mem_gbps;        /* analytical                                   */
-} PFACResult;
-
-typedef struct {
-    int np; size_t sz;
-    double cpu_ref_ms;   /* from ac_baseline for speedup reference */
-    double gpu_ms;
-    double speedup;
-    double throughput_mbps;
-} ScalePt;
-
-/* =========================================================================
- * OPTIMIZATION 1 — __constant__ memory for automaton
- * 4096 × 4 × 4B = 64 KB (exactly the CUDA constant memory limit)
- * All threads in a warp reading the same state get a FREE BROADCAST —
- * zero additional memory latency.
- * ========================================================================= */
-#define CONST_SZ (MAX_STATES * DNA_ALPHA)
-__constant__ int d_c_tbl  [CONST_SZ];    /* pure trie transitions            */
-__constant__ int d_c_out  [MAX_STATES];  /* output: pattern id or -1         */
-__constant__ int d_c_depth[MAX_STATES];  /* state depth                      */
-
-/* =========================================================================
- * GLOBALS
- * ========================================================================= */
-static ACNode  g_nodes[MAX_STATES];
-static int     g_ns = 0;
-static uint8_t g_pats[MAX_PATS][MAX_PAT_LEN];
-static int     g_pl  [MAX_PATS];
-static int     g_np  = 0;
-static Match   g_matches[MAX_MATCHES];
-static Match   g_tmp    [MAX_MATCHES];
-
-/* =========================================================================
+/* ============================================================
  * FASTA LOADER
- * ========================================================================= */
-static uint8_t *load_fasta(const char *path, size_t *len, size_t cap)
-{
-    FILE *f=fopen(path,"r");
-    if(!f){ fprintf(stderr,"[WARN] Cannot open: %s\n",path); *len=0; return NULL; }
-    fseek(f,0,SEEK_END); long fsz=ftell(f); rewind(f);
-    size_t alloc=(cap>0&&(size_t)fsz>cap)?cap+4096:(size_t)fsz+4096;
-    uint8_t *buf=(uint8_t*)malloc(alloc+1);
-    if(!buf){ fprintf(stderr,"[ERROR] malloc failed: %s\n",path); fclose(f); *len=0; return NULL; }
-    size_t pos=0; char line[8192];
-    while(fgets(line,sizeof(line),f)){
-        if(line[0]=='>') continue;
-        for(int i=0;line[i]&&line[i]!='\n'&&line[i]!='\r';i++){
-            if(cap>0&&pos>=cap) goto done;
-            int e=dna_enc((uint8_t)line[i]);
-            buf[pos++]=(e>=0)?(uint8_t)e:0xFF;
+ * Reads one FASTA file.  Skips header lines (> ...).
+ * Encodes each base to 0-3; stores 0xFF for non-ACGT bases.
+ * Stops reading after `cap_bytes` bytes of sequence.
+ * Sets *out_len to how many bytes were read.
+ * Returns malloc'd buffer (caller must free), or NULL on failure.
+ * ============================================================ */
+static uint8_t *load_fasta(const char *path, size_t *out_len, size_t cap_bytes) {
+    *out_len = 0;
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[WARN] Cannot open: %s\n", path);
+        return NULL;
+    }
+
+    /* Allocate worst-case buffer: whole file or cap + small margin */
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+    size_t alloc = (cap_bytes > 0 && (size_t)file_size > cap_bytes)
+                 ? cap_bytes + 4096
+                 : (size_t)file_size + 4096;
+
+    uint8_t *buf = (uint8_t *)malloc(alloc + 1);
+    if (!buf) {
+        fprintf(stderr, "[ERROR] malloc failed (%zu bytes)\n", alloc);
+        fclose(f);
+        return NULL;
+    }
+
+    size_t pos = 0;
+    char   line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '>') continue;          /* skip FASTA headers */
+        for (int i = 0; line[i] && line[i] != '\n' && line[i] != '\r'; i++) {
+            if (cap_bytes > 0 && pos >= cap_bytes) goto done_loading;
+            int enc = encode_base((uint8_t)line[i]);
+            buf[pos++] = (enc >= 0) ? (uint8_t)enc : 0xFF;
         }
     }
-done:
-    fclose(f); buf[pos]='\0'; *len=pos;
+done_loading:
+    fclose(f);
+    buf[pos] = '\0';
+    *out_len = pos;
     return buf;
 }
 
-/* =========================================================================
- * AC AUTOMATON BUILD  (shared trie structure; PFAC uses pure-trie slice)
- * ========================================================================= */
-static int ac_new(void){
-    if(g_ns>=MAX_STATES){ fprintf(stderr,"[ERROR] MAX_STATES exceeded.\n"); exit(1); }
-    int id=g_ns++;
-    memset(g_nodes[id].next,-1,sizeof(g_nodes[id].next));
-    g_nodes[id].fail=0; g_nodes[id].out=-1; g_nodes[id].depth=0;
+/* ============================================================
+ * TRIE / AC AUTOMATON BUILD
+ * ============================================================ */
+
+/* Allocate a new trie node and return its index. */
+static int trie_new_node(void) {
+    if (g_num_states >= MAX_STATES) {
+        fprintf(stderr, "[ERROR] MAX_STATES (%d) exceeded\n", MAX_STATES);
+        exit(EXIT_FAILURE);
+    }
+    int id = g_num_states++;
+    for (int c = 0; c < DNA_ALPHA; c++) {
+        g_trie[id].trie_next[c] = -1;
+        g_trie[id].ac_next[c]   = -1;
+    }
+    g_trie[id].fail       = 0;
+    g_trie[id].output_pat = -1;
+    g_trie[id].depth      = 0;
     return id;
 }
-static void ac_insert(const uint8_t *p, int len, int pid){
-    int cur=0;
-    for(int i=0;i<len;i++){
-        int c=dna_enc(p[i]); if(c<0) continue;
-        if(g_nodes[cur].next[c]==-1){
-            int n=ac_new(); g_nodes[n].depth=g_nodes[cur].depth+1;
-            g_nodes[cur].next[c]=n;
+
+/* Insert one pattern into the trie. */
+static void trie_insert(const uint8_t *pat, int len, int pat_id) {
+    int cur = 0;
+    for (int i = 0; i < len; i++) {
+        int c = (int)pat[i];
+        if (c < 0 || c >= DNA_ALPHA) continue;  /* skip encoded 0xFF */
+        if (g_trie[cur].trie_next[c] == -1) {
+            int child = trie_new_node();
+            g_trie[child].depth = g_trie[cur].depth + 1;
+            g_trie[cur].trie_next[c] = child;
         }
-        cur=g_nodes[cur].next[c];
+        cur = g_trie[cur].trie_next[c];
     }
-    g_nodes[cur].out=pid;
+    g_trie[cur].output_pat = pat_id;
 }
-static void ac_build_failure(void){
-    static int q[MAX_STATES]; int h=0,t=0;
-    for(int c=0;c<DNA_ALPHA;c++){
-        int s=g_nodes[0].next[c];
-        if(s==-1) g_nodes[0].next[c]=0;
-        else{ g_nodes[s].fail=0; q[t++]=s; }
+
+/*
+ * Build AC failure links via BFS.
+ *
+ * IMPORTANT: We do this AFTER trie_insert() is done.
+ * We copy trie_next[] into ac_next[] first, then let BFS fill in
+ * the failure-link shortcuts ONLY in ac_next[].
+ * trie_next[] is never touched again — PFAC kernels use trie_next[].
+ */
+static void ac_build_failure_links(void) {
+    /* Step 1: copy pure trie into ac_next */
+    for (int s = 0; s < g_num_states; s++) {
+        for (int c = 0; c < DNA_ALPHA; c++) {
+            g_trie[s].ac_next[c] = g_trie[s].trie_next[c];
+        }
     }
-    while(h<t){
-        int v=q[h++];
-        if(g_nodes[v].out==-1) g_nodes[v].out=g_nodes[g_nodes[v].fail].out;
-        for(int c=0;c<DNA_ALPHA;c++){
-            int u=g_nodes[v].next[c];
-            if(u==-1){ g_nodes[v].next[c]=g_nodes[g_nodes[v].fail].next[c]; }
-            else{
-                int x=g_nodes[v].fail;
-                while(x&&g_nodes[x].next[c]==-1) x=g_nodes[x].fail;
-                int fn=g_nodes[x].next[c]; if(fn==u)fn=0;
-                g_nodes[u].fail=fn; q[t++]=u;
+
+    /* Step 2: BFS from root to fill failure links */
+    int queue[MAX_STATES];
+    int head = 0, tail = 0;
+
+    /* Root's children: failure = root, add to queue */
+    for (int c = 0; c < DNA_ALPHA; c++) {
+        int s = g_trie[0].ac_next[c];
+        if (s == -1) {
+            g_trie[0].ac_next[c] = 0;  /* missing root child loops back to root */
+        } else {
+            g_trie[s].fail = 0;
+            queue[tail++] = s;
+        }
+    }
+
+    while (head < tail) {
+        int v = queue[head++];
+
+        /* Propagate output along suffix links */
+        if (g_trie[v].output_pat == -1) {
+            g_trie[v].output_pat = g_trie[g_trie[v].fail].output_pat;
+        }
+
+        for (int c = 0; c < DNA_ALPHA; c++) {
+            int u = g_trie[v].ac_next[c];
+            if (u == -1) {
+                /* No child — follow failure link to get transition */
+                g_trie[v].ac_next[c] = g_trie[g_trie[v].fail].ac_next[c];
+            } else {
+                /* Has child — its failure is failure[v]'s transition on c */
+                int f = g_trie[g_trie[v].fail].ac_next[c];
+                if (f == u) f = 0;  /* avoid self-loop */
+                g_trie[u].fail = f;
+                queue[tail++] = u;
             }
         }
     }
 }
 
-/* Upload PURE TRIE (no failure shortcuts) to __constant__ memory */
-static void upload_pfac_table(void){
-    static int h_tbl[CONST_SZ];
-    static int h_out[MAX_STATES];
-    static int h_dep[MAX_STATES];
-    int ns=g_ns;
-    for(int s=0;s<ns;s++){
-        h_out[s]=g_nodes[s].out;
-        h_dep[s]=g_nodes[s].depth;
-        for(int c=0;c<DNA_ALPHA;c++) h_tbl[s*DNA_ALPHA+c]=-1; /* init all undefined */
-    }
-    /* replay only real trie edges (child.depth == parent.depth + 1) */
-    for(int pi=0;pi<g_np;pi++){
-        int cur=0;
-        for(int i=0;i<g_pl[pi];i++){
-            int c=dna_enc(g_pats[pi][i]); if(c<0) break;
-            int child=g_nodes[cur].next[c];
-            if(child>0 && g_nodes[child].depth==g_nodes[cur].depth+1){
-                h_tbl[cur*DNA_ALPHA+c]=child; cur=child;
-            } else break;
+/* ============================================================
+ * UPLOAD PFAC TABLE TO GPU
+ *
+ * Uploads trie_next[] (NOT ac_next[]) to GPU memory.
+ * If states fit in constant memory: use cudaMemcpyToSymbol.
+ * Otherwise: allocate global memory and copy there.
+ *
+ * Call this once per automaton build before any pfac_scan().
+ * ============================================================ */
+static void upload_pfac_table_to_gpu(void) {
+    int ns = g_num_states;
+
+    if (ns <= CONST_MEM_MAX_STATES) {
+        /* ── Constant memory path ── */
+        g_use_const_mem = 1;
+
+        /* Build flat host arrays */
+        int h_table[CONST_TABLE_SIZE];
+        int h_out  [CONST_MEM_MAX_STATES];
+        int h_depth[CONST_MEM_MAX_STATES];
+
+        for (int s = 0; s < ns; s++) {
+            h_out  [s] = g_trie[s].output_pat;
+            h_depth[s] = g_trie[s].depth;
+            for (int c = 0; c < DNA_ALPHA; c++) {
+                h_table[s * DNA_ALPHA + c] = g_trie[s].trie_next[c];
+            }
         }
+
+        /* Copy to GPU constant memory */
+        CUDA_CHECK(cudaMemcpyToSymbol(d_const_table, h_table,
+                   ns * DNA_ALPHA * sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_const_out, h_out,
+                   ns * sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_const_depth, h_depth,
+                   ns * sizeof(int)));
+
+    } else {
+        /* ── Global memory fallback ── */
+        g_use_const_mem = 0;
+        fprintf(stderr,
+                "[WARN] States (%d) > CONST_MEM_MAX_STATES (%d): "
+                "using global memory.\n", ns, CONST_MEM_MAX_STATES);
+
+        /* Free any old allocations */
+        if (d_glob_table) { cudaFree(d_glob_table); d_glob_table = NULL; }
+        if (d_glob_out)   { cudaFree(d_glob_out);   d_glob_out   = NULL; }
+        if (d_glob_depth) { cudaFree(d_glob_depth); d_glob_depth = NULL; }
+
+        /* Allocate and fill host-side flat arrays */
+        int *h_table = (int *)malloc(ns * DNA_ALPHA * sizeof(int));
+        int *h_out   = (int *)malloc(ns * sizeof(int));
+        int *h_depth = (int *)malloc(ns * sizeof(int));
+        if (!h_table || !h_out || !h_depth) {
+            fprintf(stderr, "[ERROR] malloc failed in upload_pfac_table_to_gpu\n");
+            exit(EXIT_FAILURE);
+        }
+
+        for (int s = 0; s < ns; s++) {
+            h_out  [s] = g_trie[s].output_pat;
+            h_depth[s] = g_trie[s].depth;
+            for (int c = 0; c < DNA_ALPHA; c++) {
+                h_table[s * DNA_ALPHA + c] = g_trie[s].trie_next[c];
+            }
+        }
+
+        /* Copy to GPU global memory */
+        CUDA_CHECK(cudaMalloc(&d_glob_table, ns * DNA_ALPHA * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_glob_out,   ns * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_glob_depth, ns * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_glob_table, h_table,
+                   ns * DNA_ALPHA * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_glob_out,   h_out,
+                   ns * sizeof(int),            cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_glob_depth,  h_depth,
+                   ns * sizeof(int),            cudaMemcpyHostToDevice));
+
+        free(h_table);
+        free(h_out);
+        free(h_depth);
     }
-    CUDA_CHECK(cudaMemcpyToSymbol(d_c_tbl,  h_tbl, ns*DNA_ALPHA*sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_c_out,  h_out, ns*sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_c_depth,h_dep, ns*sizeof(int)));
 }
 
-/* =========================================================================
- * TWO-PHASE PFAC KERNELS  (Lin et al. IEEE TPDS 2023)
+/* ============================================================
+ * PFAC KERNELS
  *
- * OPTIMIZATION 2: d_c_tbl / d_c_out / d_c_depth in __constant__ memory
- * OPTIMIZATION 3: __ldg() for input stream (read-only texture cache)
- * ========================================================================= */
+ * Two-Phase approach (Lin et al. 2023):
+ *   Phase 1 (Filter):  each thread at position tid walks the trie.
+ *                      If it reaches depth >= FILTER_DEPTH, it sets
+ *                      d_flag[tid] = 1 (candidate). Otherwise exits.
+ *   Phase 2 (Verify):  only threads with d_flag[tid] == 1 continue.
+ *                      They walk the trie again fully to check for a
+ *                      complete pattern match.
+ *
+ * Each thread starts at its OWN position in the text (PFAC rule).
+ * Threads are independent — no communication needed.
+ * __ldg() loads text data through L1 texture cache (read-only).
+ * ============================================================ */
 
-/* Phase 1 — Filter Kernel
- * Each thread i checks if input[i..i+MAX_PAT_LEN-1] is a prefix of any
- * pattern. Stops immediately on undefined transition (most threads abort
- * at step 1 since only 4/4 DNA symbols are valid at root but pattern
- * prefixes are sparse). Flags candidates reaching depth >= MIN_DEPTH.    */
-__global__ void kernel_phase1_filter(
-    const uint8_t * __restrict__ d_data,
-    int   dlen,
-    uint8_t *d_flag)
+/* ── Phase 1 Filter — constant memory version ── */
+__global__ void kernel_phase1_const(
+    const uint8_t * __restrict__ d_text,
+    int                          text_len,
+    uint8_t *                    d_flag)          /* output: 1 = candidate */
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if(tid >= dlen){ return; }
+    if (tid >= text_len) return;
 
     d_flag[tid] = 0;
-    int state  = 0;
-    int limit  = tid + MAX_PAT_LEN;
-    if(limit > dlen) limit = dlen;
 
-    for(int i = tid; i < limit; i++){
-        int c = (int)__ldg(&d_data[i]);   /* OPTIMIZATION 3: texture cache  */
-        if(c == 0xFF) return;              /* non-DNA byte — stop            */
-        int nxt = d_c_tbl[state * DNA_ALPHA + c];  /* OPTIMIZATION 2        */
-        if(nxt < 0) return;                /* undefined trie edge — stop     */
-        state = nxt;
-        if(d_c_depth[state] >= MIN_DEPTH){
-            d_flag[tid] = 1;               /* candidate — pass to Phase 2    */
+    int state = 0;
+    int end   = tid + PAT_LEN;
+    if (end > text_len) end = text_len;
+
+    for (int i = tid; i < end; i++) {
+        int c = (int)__ldg(&d_text[i]);
+        if (c == 0xFF) return;              /* non-ACGT base: dead end */
+        int next_state = d_const_table[state * DNA_ALPHA + c];
+        if (next_state < 0) return;         /* no trie edge: dead end  */
+        state = next_state;
+        if (d_const_depth[state] >= FILTER_DEPTH) {
+            d_flag[tid] = 1;               /* pass to phase 2         */
             return;
         }
     }
 }
 
-/* Phase 2 — Verify Kernel
- * Only threads flagged in Phase 1 re-walk the trie.
- * On reaching a terminal state, records the match atomically.           */
-__global__ void kernel_phase2_verify(
-    const uint8_t * __restrict__ d_data,
-    int   dlen,
+/* ── Phase 2 Verify — constant memory version ── */
+__global__ void kernel_phase2_const(
+    const uint8_t * __restrict__ d_text,
+    int                          text_len,
     const uint8_t * __restrict__ d_flag,
-    int  *d_cnt,
-    Match *d_matches,
-    int   max_m)
+    int *                        d_match_count,
+    Match *                      d_matches,
+    int                          max_matches)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if(tid >= dlen) return;
-    if(!__ldg(&d_flag[tid])) return;  /* skip non-candidates               */
+    if (tid >= text_len)   return;
+    if (!d_flag[tid])      return;         /* filtered out in phase 1 */
 
     int state = 0;
-    int limit = tid + MAX_PAT_LEN;
-    if(limit > dlen) limit = dlen;
+    int end   = tid + PAT_LEN;
+    if (end > text_len) end = text_len;
 
-    for(int i = tid; i < limit; i++){
-        int c = (int)__ldg(&d_data[i]);
-        if(c == 0xFF) return;
-        int nxt = d_c_tbl[state * DNA_ALPHA + c];
-        if(nxt < 0) return;
-        state = nxt;
-        if(d_c_out[state] != -1){
-            int slot = atomicAdd(d_cnt, 1);
-            if(slot < max_m){
+    for (int i = tid; i < end; i++) {
+        int c = (int)__ldg(&d_text[i]);
+        if (c == 0xFF) return;
+        int next_state = d_const_table[state * DNA_ALPHA + c];
+        if (next_state < 0) return;
+        state = next_state;
+        if (d_const_out[state] != -1) {
+            /* Found a match — grab a slot atomically */
+            int slot = atomicAdd(d_match_count, 1);
+            if (slot < max_matches) {
                 d_matches[slot].pos = i;
-                d_matches[slot].pat = d_c_out[state];
+                d_matches[slot].pat = d_const_out[state];
+            }
+            return;  /* one match per starting position is enough */
+        }
+    }
+}
+
+/* ── Phase 1 Filter — global memory fallback ── */
+__global__ void kernel_phase1_global(
+    const uint8_t * __restrict__ d_text,
+    int                          text_len,
+    uint8_t *                    d_flag,
+    const int * __restrict__     g_table,
+    const int * __restrict__     g_depth)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= text_len) return;
+
+    d_flag[tid] = 0;
+    int state = 0;
+    int end   = tid + PAT_LEN;
+    if (end > text_len) end = text_len;
+
+    for (int i = tid; i < end; i++) {
+        int c = (int)__ldg(&d_text[i]);
+        if (c == 0xFF) return;
+        int next_state = __ldg(&g_table[state * DNA_ALPHA + c]);
+        if (next_state < 0) return;
+        state = next_state;
+        if (__ldg(&g_depth[state]) >= FILTER_DEPTH) {
+            d_flag[tid] = 1;
+            return;
+        }
+    }
+}
+
+/* ── Phase 2 Verify — global memory fallback ── */
+__global__ void kernel_phase2_global(
+    const uint8_t * __restrict__ d_text,
+    int                          text_len,
+    const uint8_t * __restrict__ d_flag,
+    int *                        d_match_count,
+    Match *                      d_matches,
+    int                          max_matches,
+    const int * __restrict__     g_table,
+    const int * __restrict__     g_out)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= text_len)  return;
+    if (!d_flag[tid])     return;
+
+    int state = 0;
+    int end   = tid + PAT_LEN;
+    if (end > text_len) end = text_len;
+
+    for (int i = tid; i < end; i++) {
+        int c = (int)__ldg(&d_text[i]);
+        if (c == 0xFF) return;
+        int next_state = __ldg(&g_table[state * DNA_ALPHA + c]);
+        if (next_state < 0) return;
+        state = next_state;
+        if (__ldg(&g_out[state]) != -1) {
+            int slot = atomicAdd(d_match_count, 1);
+            if (slot < max_matches) {
+                d_matches[slot].pos = i;
+                d_matches[slot].pat = __ldg(&g_out[state]);
             }
             return;
         }
     }
 }
 
-/* =========================================================================
- * GPU SCAN WRAPPER
- * ========================================================================= */
-static int pfac_scan(const uint8_t *h_data, int dlen,
-                     Match *h_out, PFACResult *r)
-{
-    /* Upload automaton to __constant__ memory */
-    upload_pfac_table();
+/* ============================================================
+ * CPU AC SCAN  —  single-threaded Aho-Corasick on host
+ *
+ * Used to: (a) measure CPU reference time for speedup calc,
+ *          (b) measure per-point CPU time in scalability sweep.
+ *
+ * Uses ac_next[] (with failure links), NOT trie_next[].
+ * Returns number of matches found.
+ * ============================================================ */
+static int cpu_ac_scan(const uint8_t *text, int text_len,
+                       Match *out, int max_out) {
+    int state = 0;
+    int count = 0;
+    for (int i = 0; i < text_len; i++) {
+        int c = (int)text[i];
+        if (c == 0xFF) { state = 0; continue; }
+        if (c < 0 || c >= DNA_ALPHA) { state = 0; continue; }
 
-    size_t dat_b = (size_t)dlen;
-    size_t flg_b = (size_t)dlen;
-    size_t mat_b = (size_t)MAX_MATCHES * sizeof(Match);
-    r->mem_bytes = (size_t)g_ns*(DNA_ALPHA+2)*sizeof(int) + dat_b + flg_b + mat_b;
+        state = g_trie[state].ac_next[c];
+        if (state < 0) state = 0;
 
-    uint8_t *d_data; CUDA_CHECK(cudaMalloc(&d_data, dat_b));
-    uint8_t *d_flag; CUDA_CHECK(cudaMalloc(&d_flag, flg_b));
-    int     *d_cnt;  CUDA_CHECK(cudaMalloc(&d_cnt,  sizeof(int)));
-    Match   *d_mat;  CUDA_CHECK(cudaMalloc(&d_mat,  mat_b));
-
-    CUDA_CHECK(cudaMemcpy(d_data, h_data, dat_b, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_flag, 0, flg_b));
-    CUDA_CHECK(cudaMemset(d_cnt,  0, sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_mat,  0, mat_b));
-
-    int blocks = (dlen + TPB - 1) / TPB;
-
-    /* Occupancy via CUDA runtime API */
-    int mab1=0, mab2=0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mab1, kernel_phase1_filter, TPB, 0));
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mab2, kernel_phase2_verify, TPB, 0));
-    cudaDeviceProp dp; CUDA_CHECK(cudaGetDeviceProperties(&dp, 0));
-    double occ1 = (double)(mab1*TPB)/(double)dp.maxThreadsPerMultiProcessor*100.0;
-    double occ2 = (double)(mab2*TPB)/(double)dp.maxThreadsPerMultiProcessor*100.0;
-    r->occupancy_pct = (occ1+occ2)/2.0;
-    if(r->occupancy_pct > 100.0) r->occupancy_pct = 100.0;
-
-    /* Timed execution — Phase 1 and Phase 2 separately */
-    cudaEvent_t e0,e1,e2,e3;
-    CUDA_CHECK(cudaEventCreate(&e0)); CUDA_CHECK(cudaEventCreate(&e1));
-    CUDA_CHECK(cudaEventCreate(&e2)); CUDA_CHECK(cudaEventCreate(&e3));
-
-    CUDA_CHECK(cudaEventRecord(e0));
-    kernel_phase1_filter<<<blocks,TPB>>>(d_data, dlen, d_flag);
-    CUDA_CHECK(cudaEventRecord(e1));
-    CUDA_CHECK(cudaEventSynchronize(e1));
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaEventRecord(e2));
-    kernel_phase2_verify<<<blocks,TPB>>>(d_data, dlen, d_flag, d_cnt, d_mat, MAX_MATCHES);
-    CUDA_CHECK(cudaEventRecord(e3));
-    CUDA_CHECK(cudaEventSynchronize(e3));
-    CUDA_CHECK(cudaGetLastError());
-
-    float ms1=0, ms2=0;
-    CUDA_CHECK(cudaEventElapsedTime(&ms1, e0, e1));
-    CUDA_CHECK(cudaEventElapsedTime(&ms2, e2, e3));
-    r->phase1_ms  = (double)ms1;
-    r->phase2_ms  = (double)ms2;
-    r->kernel_ms  = (double)(ms1 + ms2);
-
-    int hcnt=0;
-    CUDA_CHECK(cudaMemcpy(&hcnt, d_cnt, sizeof(int), cudaMemcpyDeviceToHost));
-    int safe = hcnt < MAX_MATCHES ? hcnt : MAX_MATCHES;
-    CUDA_CHECK(cudaMemcpy(h_out, d_mat, safe*sizeof(Match), cudaMemcpyDeviceToHost));
-
-    /* Analytical profiling estimates
-     * NOTE: Replace these with ncu output for paper publication.
-     * Warp Efficiency: full warps (no partial) / total warps
-     * Branch Divergence: fraction of warps with early-exit divergence
-     *   For DNA with 4-symbol alphabet and sparse patterns, most Phase1
-     *   threads abort at step 1-2 uniformly → low divergence.
-     * Memory Throughput: input bytes read / kernel time
-     *   With __ldg() + __constant__ table, dominant cost is input stream. */
-    int tw = (dlen+WARP-1)/WARP, aw = dlen/WARP;
-    r->warp_eff_pct   = tw>0 ? (double)aw/(double)tw*100.0 : 100.0;
-    double crate      = (double)safe / (double)(dlen>0?dlen:1);
-    r->branch_div_pct = crate*50.0; if(r->branch_div_pct>5.0) r->branch_div_pct=5.0;
-    r->mem_gbps       = r->kernel_ms>0 ? (double)dat_b/1e9/(r->kernel_ms/1000.0) : 0.0;
-
-    CUDA_CHECK(cudaFree(d_data)); CUDA_CHECK(cudaFree(d_flag));
-    CUDA_CHECK(cudaFree(d_cnt));  CUDA_CHECK(cudaFree(d_mat));
-    CUDA_CHECK(cudaEventDestroy(e0)); CUDA_CHECK(cudaEventDestroy(e1));
-    CUDA_CHECK(cudaEventDestroy(e2)); CUDA_CHECK(cudaEventDestroy(e3));
-    return safe;
+        /* Walk suffix link chain to collect all outputs */
+        int s = state;
+        while (s > 0) {
+            if (g_trie[s].output_pat != -1) {
+                if (count < max_out) {
+                    out[count].pos = i;
+                    out[count].pat = g_trie[s].output_pat;
+                }
+                count++;
+                break;
+            }
+            s = g_trie[s].fail;
+        }
+    }
+    return count;
 }
 
-/* =========================================================================
- * REPORT
- * ========================================================================= */
-static void sep(char c,int w){ for(int i=0;i<w;i++) putchar(c); putchar('\n'); }
+/* ============================================================
+ * GPU PFAC SCAN WRAPPER
+ *
+ * Does exactly this:
+ *   1. Upload table (rebuild each call — required for sweep)
+ *   2. Allocate GPU memory
+ *   3. Copy text to GPU
+ *   4. Launch Phase 1 kernel, time it
+ *   5. Launch Phase 2 kernel, time it
+ *   6. Copy results back
+ *   7. Free GPU memory
+ *   8. Fill result struct
+ *
+ * Returns number of matches found.
+ * ============================================================ */
+typedef struct {
+    double wall_ms;          /* total wall-clock time including memcpy    */
+    double kernel_ms;        /* Phase1 + Phase2 kernel time only          */
+    double phase1_ms;        /* Phase 1 alone                             */
+    double phase2_ms;        /* Phase 2 alone                             */
+    double throughput_mbps;  /* MB/s based on kernel time                 */
+    double speedup;          /* kernel time vs CPU AC (filled by caller)  */
+    size_t gpu_mem_bytes;    /* GPU memory allocated for this scan        */
+    double occupancy_pct;    /* from cudaOccupancyMaxActiveBlocksPerMP    */
+    int    match_count;
+} ScanResult;
 
-static void report(const PFACResult *r, const ScalePt *sp, int nsp,
-                   int np, size_t total, cudaDeviceProp *dp,
-                   double cpu_ref_ms)
-{
-    const int W=76;
-    printf("\n"); sep('=',W);
+static int pfac_gpu_scan(const uint8_t *h_text, int text_len,
+                         Match *h_out, ScanResult *result) {
+    hrtimer_t wall_start, wall_end;
+    hrtimer_now(&wall_start);
+
+    /* Selalu upload tabel sebelum scan */
+    upload_pfac_table_to_gpu();
+
+    /* ── KONFIGURASI CHUNK / SLIDING WINDOW ── */
+    // Batasi ukuran data di GPU maksimal 512 MB per iterasi
+    const size_t CHUNK_SIZE = 512UL * 1024 * 1024; 
+    size_t active_chunk_size = (text_len < CHUNK_SIZE) ? text_len : CHUNK_SIZE;
+
+    /* ── Alokasikan GPU buffers dengan ukuran terbatas ── */
+    uint8_t *d_text  = NULL;
+    uint8_t *d_flag  = NULL;
+    int     *d_count = NULL;
+    Match   *d_matches = NULL;
+
+    size_t text_bytes    = active_chunk_size;
+    size_t flag_bytes    = active_chunk_size;
+    size_t count_bytes   = sizeof(int);
+    size_t matches_bytes = (size_t)MAX_MATCHES * sizeof(Match);
+
+    CUDA_CHECK(cudaMalloc(&d_text,    text_bytes));
+    CUDA_CHECK(cudaMalloc(&d_flag,    flag_bytes));
+    CUDA_CHECK(cudaMalloc(&d_count,   count_bytes));
+    CUDA_CHECK(cudaMalloc(&d_matches, matches_bytes));
+
+    result->gpu_mem_bytes = text_bytes + flag_bytes + count_bytes + matches_bytes
+                          + (size_t)g_num_states * (DNA_ALPHA + 2) * sizeof(int);
+
+    /* ── Occupancy measurement ── */
+    int max_blocks_p1 = 0, max_blocks_p2 = 0;
+    if (g_use_const_mem) {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                   &max_blocks_p1, kernel_phase1_const, THREADS_PER_BLOCK, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                   &max_blocks_p2, kernel_phase2_const, THREADS_PER_BLOCK, 0));
+    } else {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                   &max_blocks_p1, kernel_phase1_global, THREADS_PER_BLOCK, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                   &max_blocks_p2, kernel_phase2_global, THREADS_PER_BLOCK, 0));
+    }
+    cudaDeviceProp dp;
+    CUDA_CHECK(cudaGetDeviceProperties(&dp, 0));
+    double occ1 = (double)(max_blocks_p1 * THREADS_PER_BLOCK)
+                / (double)dp.maxThreadsPerMultiProcessor * 100.0;
+    double occ2 = (double)(max_blocks_p2 * THREADS_PER_BLOCK)
+                / (double)dp.maxThreadsPerMultiProcessor * 100.0;
+    result->occupancy_pct = (occ1 + occ2) / 2.0;
+    if (result->occupancy_pct > 100.0) result->occupancy_pct = 100.0;
+
+    /* ── CUDA events for kernel timing ── */
+    cudaEvent_t ev_p1_start, ev_p1_end, ev_p2_start, ev_p2_end;
+    CUDA_CHECK(cudaEventCreate(&ev_p1_start));
+    CUDA_CHECK(cudaEventCreate(&ev_p1_end));
+    CUDA_CHECK(cudaEventCreate(&ev_p2_start));
+    CUDA_CHECK(cudaEventCreate(&ev_p2_end));
+
+    /* ── LOOPING UNTUK MEMPROSES PER CHUNK ── */
+    size_t offset = 0;
+    int total_matches = 0;
+    result->phase1_ms = 0.0;
+    result->phase2_ms = 0.0;
+    result->kernel_ms = 0.0;
+
+    while (offset < (size_t)text_len) {
+        // Hitung ukuran sisa data yang akan diproses
+        size_t current_chunk = (size_t)text_len - offset;
+        if (current_chunk > CHUNK_SIZE) {
+            /* Kita sisakan overlap sebesar PAT_LEN agar k-mer 
+               yang terpotong di ujung chunk tetap bisa terbaca */
+            current_chunk = CHUNK_SIZE;
+        }
+
+        /* 1. Copy sebagian text ke GPU */
+        CUDA_CHECK(cudaMemcpy(d_text, h_text + offset, current_chunk, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(d_flag,  0, current_chunk));
+        CUDA_CHECK(cudaMemset(d_count, 0, count_bytes));
+        CUDA_CHECK(cudaMemset(d_matches, 0, matches_bytes));
+
+        int num_blocks = (current_chunk + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        /* 2. Jalankan Phase 1: Filter */
+        CUDA_CHECK(cudaEventRecord(ev_p1_start));
+        if (g_use_const_mem) {
+            kernel_phase1_const<<<num_blocks, THREADS_PER_BLOCK>>>(
+                d_text, (int)current_chunk, d_flag);
+        } else {
+            kernel_phase1_global<<<num_blocks, THREADS_PER_BLOCK>>>(
+                d_text, (int)current_chunk, d_flag, d_glob_table, d_glob_depth);
+        }
+        CUDA_CHECK(cudaEventRecord(ev_p1_end));
+        CUDA_CHECK(cudaEventSynchronize(ev_p1_end));
+        CUDA_CHECK(cudaGetLastError());
+
+        /* 3. Jalankan Phase 2: Verify */
+        CUDA_CHECK(cudaEventRecord(ev_p2_start));
+        if (g_use_const_mem) {
+            kernel_phase2_const<<<num_blocks, THREADS_PER_BLOCK>>>(
+                d_text, (int)current_chunk, d_flag, d_count, d_matches, MAX_MATCHES);
+        } else {
+            kernel_phase2_global<<<num_blocks, THREADS_PER_BLOCK>>>(
+                d_text, (int)current_chunk, d_flag, d_count, d_matches, MAX_MATCHES,
+                d_glob_table, d_glob_out);
+        }
+        CUDA_CHECK(cudaEventRecord(ev_p2_end));
+        CUDA_CHECK(cudaEventSynchronize(ev_p2_end));
+        CUDA_CHECK(cudaGetLastError());
+
+        /* 4. Akumulasi Waktu Kernel */
+        float ms_p1 = 0.0f, ms_p2 = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms_p1, ev_p1_start, ev_p1_end));
+        CUDA_CHECK(cudaEventElapsedTime(&ms_p2, ev_p2_start, ev_p2_end));
+        result->phase1_ms += (double)ms_p1;
+        result->phase2_ms += (double)ms_p2;
+        result->kernel_ms += (double)(ms_p1 + ms_p2);
+
+        /* 5. Copy match count dan data match kembali ke Host */
+        int gpu_count = 0;
+        CUDA_CHECK(cudaMemcpy(&gpu_count, d_count, sizeof(int), cudaMemcpyDeviceToHost));
+        
+        int safe_count = (gpu_count < MAX_MATCHES) ? gpu_count : MAX_MATCHES;
+        
+        // Simpan match ke host buffer dengan mengoreksi offset posisi aslinya
+        if (total_matches + safe_count <= MAX_MATCHES) {
+            // 1. Change 'Match' to 'Match*'
+            Match* temp_host_buf = (Match*)malloc(safe_count * sizeof(Match));
+
+            // 2. Perform the copy
+            CUDA_CHECK(cudaMemcpy(temp_host_buf, d_matches, safe_count * sizeof(Match), cudaMemcpyDeviceToHost));
+
+            // 3. The loop remains the same, but now uses the pointer correctly
+            for (int m = 0; m < safe_count; m++) {
+                h_out[total_matches].pos = temp_host_buf[m].pos + offset; 
+                h_out[total_matches].pat = temp_host_buf[m].pat;
+                total_matches++;
+            }
+
+            // 4. Free the pointer
+            free(temp_host_buf);
+        }
+
+        /* 6. Geser offset ke chunk berikutnya */
+        if (current_chunk == CHUNK_SIZE) {
+            // Geser sejauh CHUNK_SIZE dikurangi overlap k-mer agar tidak ada k-mer yang terlewat di batas chunk
+            offset += (CHUNK_SIZE - PAT_LEN + 1);
+        } else {
+            offset += current_chunk;
+        }
+    }
+
+    /* ── Free GPU memory ── */
+    CUDA_CHECK(cudaFree(d_text));
+    CUDA_CHECK(cudaFree(d_flag));
+    CUDA_CHECK(cudaFree(d_count));
+    CUDA_CHECK(cudaFree(d_matches));
+    CUDA_CHECK(cudaEventDestroy(ev_p1_start));
+    CUDA_CHECK(cudaEventDestroy(ev_p1_end));
+    CUDA_CHECK(cudaEventDestroy(ev_p2_start));
+    CUDA_CHECK(cudaEventDestroy(ev_p2_end));
+
+    hrtimer_now(&wall_end);
+    result->wall_ms         = hrtimer_ms(&wall_start, &wall_end);
+    result->throughput_mbps = (double)text_len / 1e6
+                            / (result->kernel_ms / 1000.0);
+    result->match_count     = total_matches;
+    return total_matches;
+}
+
+/* ============================================================
+ * BUILD AUTOMATON FROM SCRATCH
+ *
+ * We call this once for the full dataset, then again for each
+ * scalability sweep point with a subset of patterns.
+ * ============================================================ */
+static void build_automaton(int num_pats) {
+    g_num_states = 0;
+    trie_new_node();  /* create root = node 0 */
+    for (int i = 0; i < num_pats; i++) {
+        trie_insert(g_pats[i], g_pat_len[i], i);
+    }
+    ac_build_failure_links();
+}
+
+/* ============================================================
+ * PRINT SEPARATOR
+ * ============================================================ */
+static void print_line(char c, int w) {
+    for (int i = 0; i < w; i++) putchar(c);
+    putchar('\n');
+}
+
+/* ============================================================
+ * MAIN
+ * ============================================================ */
+int main(void) {
+    print_line('=', 72);
+    printf("  PFAC GPU  —  Two-Phase PFAC (caveman edition)\n");
+    printf("  Ref: Lin et al., IEEE TPDS 2023 [Ref 10]\n");
+    print_line('=', 72);
+    printf("\n");
+
+    /* ── Init CUDA ── */
+    printf("Initializing CUDA...\n");
+    cudaDeviceProp dp;
+    CUDA_CHECK(cudaGetDeviceProperties(&dp, 0));
+    printf("  GPU: %s (Compute %d.%d, %d SMs, %.1f GB)\n\n",
+           dp.name, dp.major, dp.minor,
+           dp.multiProcessorCount, (double)dp.totalGlobalMem / 1e9);
+
+    /* ── Load FASTA datasets ── */
+    printf("Loading FASTA datasets (cap: %lu MB each)...\n", FASTA_CAP_MB);
+
+    size_t  len[4] = {0, 0, 0, 0};
+    uint8_t *raw[4];
+
+    const char *paths[4] = { PATH_EXONS, PATH_CHM13, PATH_DMEL, PATH_YEAST };
+    const char *labels[4] = {
+        "[1/4] Human exons (hg38)    ",
+        "[2/4] Human T2T CHM13       ",
+        "[3/4] D. melanogaster r6.66 ",
+        "[4/4] S. cerevisiae S288c   "
+    };
+    size_t cap[4] = {
+        FASTA_CAP_MB * 1024 * 1024,
+        FASTA_CAP_MB * 1024 * 1024,
+        FASTA_CAP_MB * 1024 * 1024,
+        0   /* yeast is small, load all of it */
+    };
+
+    for (int i = 0; i < 4; i++) {
+        printf("  %s... ", labels[i]); fflush(stdout);
+        raw[i] = load_fasta(paths[i], &len[i], cap[i]);
+        printf("%.3f MB\n", (double)len[i] / 1e6);
+    }
+
+    /* ── Concatenate into one buffer ── */
+    size_t total_len = len[0] + len[1] + len[2] + len[3];
+    if (total_len == 0) {
+        fprintf(stderr, "[ERROR] No data loaded. Check file paths.\n");
+        return 1;
+    }
+
+    uint8_t *text = (uint8_t *)malloc(total_len + 1);
+    if (!text) { fprintf(stderr, "[ERROR] malloc failed\n"); return 1; }
+
+    size_t wp = 0;
+    for (int i = 0; i < 4; i++) {
+        if (raw[i]) { memcpy(text + wp, raw[i], len[i]); wp += len[i]; free(raw[i]); }
+    }
+    text[wp] = '\0';
+
+    printf("\n  Total input : %.3f MB\n", (double)total_len / 1e6);
+
+    /* ── Extract k-mer motifs (evenly spaced across corpus) ── */
+    int    stride = (int)(total_len / MAX_PATTERNS) + 1;
+    g_num_pats = 0;
+    for (size_t i = 0;
+         i + (size_t)PAT_LEN <= total_len && g_num_pats < MAX_PATTERNS;
+         i += stride)
+    {
+        int ok = 1;
+        for (int j = 0; j < PAT_LEN; j++) {
+            if (text[i + j] == 0xFF) { ok = 0; break; }
+        }
+        if (ok) {
+            memcpy(g_pats[g_num_pats], text + i, PAT_LEN);
+            g_pat_len[g_num_pats] = PAT_LEN;
+            g_num_pats++;
+        }
+    }
+    printf("  Motifs      : %d (k=%d nt, stride=%d)\n\n",
+           g_num_pats, PAT_LEN, stride);
+
+    /* ── Build full automaton ── */
+    printf("Building AC trie + failure links...\n");
+    build_automaton(g_num_pats);
+    printf("  States: %d  |  PFAC table: %d KB (%s)\n\n",
+           g_num_states,
+           g_num_states * DNA_ALPHA * 4 / 1024,
+           g_num_states <= CONST_MEM_MAX_STATES ? "__constant__" : "global memory");
+
+    int text_len = (int)total_len;
+
+    /* ── GPU warm-up (short run so driver is ready) ── */
+    printf("GPU warm-up...\n");
+    {
+        ScanResult warmup; memset(&warmup, 0, sizeof(warmup));
+        int warmup_len = (text_len < 8192) ? text_len : 8192;
+        pfac_gpu_scan(text, warmup_len, g_match_buf, &warmup);
+    }
+
+    /* ── CPU reference time (full dataset) ── */
+    printf("Measuring CPU AC reference time...\n"); fflush(stdout);
+    hrtimer_t cpu_t0, cpu_t1;
+    hrtimer_now(&cpu_t0);
+    int cpu_hits = cpu_ac_scan(text, text_len, g_sweep_buf, MAX_MATCHES);
+    hrtimer_now(&cpu_t1);
+    double cpu_ref_ms = hrtimer_ms(&cpu_t0, &cpu_t1);
+    printf("  CPU AC: %d matches in %.3f ms\n\n", cpu_hits, cpu_ref_ms);
+
+    /* ── Main PFAC scan ── */
+    printf("Running Two-Phase PFAC scan...\n"); fflush(stdout);
+    ScanResult main_result;
+    memset(&main_result, 0, sizeof(main_result));
+
+    hrtimer_t scan_t0, scan_t1;
+    hrtimer_now(&scan_t0);
+    pfac_gpu_scan(text, text_len, g_match_buf, &main_result);
+    hrtimer_now(&scan_t1);
+
+    main_result.wall_ms = hrtimer_ms(&scan_t0, &scan_t1);
+    main_result.speedup = (main_result.kernel_ms > 0)
+                        ? cpu_ref_ms / main_result.kernel_ms : 0.0;
+
+    printf("  Done: %d matches in %.3f ms wall / %.3f ms kernel  (%.2f MB/s)\n",
+           main_result.match_count, main_result.wall_ms,
+           main_result.kernel_ms, main_result.throughput_mbps);
+    printf("  Kernel: Phase1=%.3fms  Phase2=%.3fms  Total=%.3fms\n\n",
+           main_result.phase1_ms, main_result.phase2_ms, main_result.kernel_ms);
+
+    /* ── Scalability sweep ──
+     *
+     * 5 points: vary both pattern count and input size simultaneously.
+     * For each point:
+     *   1. Rebuild automaton with subset of patterns
+     *   2. Measure CPU time on that subset × input size
+     *   3. Measure GPU time on same subset × input size
+     *   Both use the same subset → speedup is apples-to-apples.
+     */
+    printf("Scalability sweep (5 points, CPU + GPU each)...\n"); fflush(stdout);
+
+    const double pat_fracs [5] = { 0.10, 0.25, 0.50, 0.75, 1.00 };
+    const double size_fracs[5] = { 0.05, 0.15, 0.30, 0.60, 1.00 };
+
+    typedef struct {
+        int    num_pats;
+        size_t input_bytes;
+        double cpu_ms;
+        double gpu_kernel_ms;
+        double throughput_mbps;
+        double speedup;
+    } SweepPoint;
+
+    SweepPoint sweep[5];
+
+    for (int si = 0; si < 5; si++) {
+        int    sub_pats = (int)(g_num_pats * pat_fracs[si]);
+        if (sub_pats < 1) sub_pats = 1;
+        size_t sub_len  = (size_t)(total_len * size_fracs[si]);
+        if (sub_len < 1024) sub_len = 1024;
+
+        /* Rebuild automaton for this pattern subset */
+        build_automaton(sub_pats);
+
+        /* CPU time on this subset */
+        hrtimer_t ct0, ct1;
+        hrtimer_now(&ct0);
+        cpu_ac_scan(text, (int)sub_len, g_sweep_buf, MAX_MATCHES);
+        hrtimer_now(&ct1);
+        double sub_cpu_ms = hrtimer_ms(&ct0, &ct1);
+
+        /* GPU time on this subset (upload_pfac_table called inside) */
+        ScanResult sub_gpu;
+        memset(&sub_gpu, 0, sizeof(sub_gpu));
+        pfac_gpu_scan(text, (int)sub_len, g_sweep_buf, &sub_gpu);
+
+        sweep[si].num_pats        = sub_pats;
+        sweep[si].input_bytes     = sub_len;
+        sweep[si].cpu_ms          = sub_cpu_ms;
+        sweep[si].gpu_kernel_ms   = sub_gpu.kernel_ms;
+        sweep[si].throughput_mbps = sub_gpu.throughput_mbps;
+        sweep[si].speedup         = (sub_gpu.kernel_ms > 0)
+                                  ? sub_cpu_ms / sub_gpu.kernel_ms : 0.0;
+
+        printf("  [%d/5] %3d motifs x %.2f MB : CPU=%.3fms  GPU=%.3fms  %.2fx\n",
+               si + 1, sub_pats, (double)sub_len / 1e6,
+               sub_cpu_ms, sub_gpu.kernel_ms, sweep[si].speedup);
+        fflush(stdout);
+    }
+
+    /* Restore full automaton after sweep */
+    build_automaton(g_num_pats);
+
+    /* ============================================================
+     * FINAL REPORT
+     * ============================================================ */
+    printf("\n");
+    print_line('=', 72);
     printf("  PFAC GPU — BENCHMARK RESULTS\n");
     printf("  Ref: Lin et al., IEEE TPDS 2023 (Two-Phase PFAC) [Ref 10]\n");
-    sep('=',W);
+    print_line('=', 72);
+
     printf("\n  GPU         : %s  (Compute %d.%d, %d SMs, %.1f GB)\n",
-           dp->name,dp->major,dp->minor,dp->multiProcessorCount,(double)dp->totalGlobalMem/1e9);
+           dp.name, dp.major, dp.minor,
+           dp.multiProcessorCount, (double)dp.totalGlobalMem / 1e9);
     printf("  Algorithm   : Two-Phase PFAC (Phase1=Filter, Phase2=Verify)\n");
-    printf("  Alphabet    : DNA 4-symbol {A,C,G,T} — compressed from 256\n");
-    printf("  Table       : %d states × 6 × 4B = %d KB (__constant__ memory)\n",
-           g_ns, g_ns*DNA_ALPHA*4/1024);
-    printf("  Patterns    : %d k-mers (k=%d nt)  |  AC States: %d\n",np,MAX_PAT_LEN,g_ns);
-    printf("  Input       : %.3f MB (%zu bytes)\n\n",(double)total/1e6,total);
+    printf("  Alphabet    : DNA 4-symbol {A,C,G,T}\n");
+    printf("  Table       : %d states x %d x 4B = %d KB (%s)\n",
+           g_num_states, DNA_ALPHA, g_num_states * DNA_ALPHA * 4 / 1024,
+           g_use_const_mem ? "__constant__ memory" : "global memory");
+    printf("  Patterns    : %d k-mers (k=%d nt)  |  AC States: %d\n",
+           g_num_pats, PAT_LEN, g_num_states);
+    printf("  Input       : %.3f MB (%d bytes)\n\n",
+           (double)text_len / 1e6, text_len);
 
-    sep('-',W);
-    printf("  COMPARISON METRICS  (compare with ac_baseline.exe output)\n"); sep('-',W);
-    printf("  %-34s  %12.3f ms\n", "1. Execution Time (wall)",  r->exec_ms);
-    printf("  %-34s  %12.2f MB/s\n","2. Throughput",            r->throughput_mbps);
-    printf("  %-34s  %12.2fx\n",   "3. SpeedUp (vs CPU AC)",    r->speedup);
-    printf("  %-34s  %12.2f MB\n", "4. Memory Usage (GPU)",     (double)r->mem_bytes/1e6);
-    printf("  %-34s  %12d\n",      "5. Matches Found",          r->matches);
-    printf("  %-34s  %12s\n",      "   Accuracy note",
-           "PFAC finds overlapping hits (see Notes)");
+    print_line('-', 72);
+    printf("  COMPARISON METRICS  (compare with ac_baseline output)\n");
+    print_line('-', 72);
+    printf("  %-36s %12.3f ms\n", "1a. Execution Time (wall)",   main_result.wall_ms);
+    printf("  %-36s %12.3f ms\n", "1b. Execution Time (kernel)",  main_result.kernel_ms);
+    printf("  %-36s %12.2f MB/s\n","2. Throughput (kernel time)", main_result.throughput_mbps);
+    printf("  %-36s %12.2fx\n",   "3. SpeedUp (kernel vs CPU AC)",main_result.speedup);
+    printf("     CPU AC reference               :  %.3f ms\n", cpu_ref_ms);
+    printf("  %-36s %12.2f MB\n", "4. Memory Usage (GPU)",
+           (double)main_result.gpu_mem_bytes / 1e6);
+    printf("  %-36s %12d\n",      "5. Matches Found",             main_result.match_count);
+    printf("     Accuracy note                  :  PFAC finds overlapping hits (see Notes)\n");
 
-    printf("\n  6. Scalability:\n");
-    printf("     %-8s  %-12s  %10s  %10s  %8s\n",
-           "Motifs","Input(MB)","GPU(ms)","Throughput","SpeedUp");
-    for(int i=0;i<nsp;i++)
-        printf("     %-8d  %-12.3f  %10.3f  %6.1f MB/s  %7.2fx\n",
-               sp[i].np,(double)sp[i].sz/1e6,
-               sp[i].gpu_ms,sp[i].throughput_mbps,sp[i].speedup);
-
-    printf("\n"); sep('-',W);
-    printf("  PROFILING METRICS  (Two-Phase PFAC Kernel)\n"); sep('-',W);
-    printf("  %-38s  %10.3f ms\n","1. Kernel Time — Phase 1 (Filter)",r->phase1_ms);
-    printf("  %-38s  %10.3f ms\n","   Kernel Time — Phase 2 (Verify)",r->phase2_ms);
-    printf("  %-38s  %10.3f ms\n","   Kernel Time — Total",           r->kernel_ms);
-    printf("  %-38s  %9.1f %%\n", "2. Occupancy (CUDA API)",          r->occupancy_pct);
-    printf("  %-38s  %9.1f %% *\n","3. Warp Efficiency (est.)",       r->warp_eff_pct);
-    printf("  %-38s  %9.2f %% *\n","4. Branch Divergence (est.)",     r->branch_div_pct);
-    printf("  %-38s  %9.2f GB/s*\n","5. Memory Throughput (est.)",    r->mem_gbps);
-    printf("  * = analytical estimate. Use ncu for publication values.\n");
-
-    printf("\n"); sep('-',W);
-    printf("  RUN THIS FOR REAL PROFILING METRICS (paper-ready):\n"); sep('-',W);
-    printf("  ncu --metrics ^\n");
-    printf("    sm__warps_active.avg.pct_of_peak_sustained_active,^\n");
-    printf("    smsp__sass_average_branch_targets_threads_uniform.pct,^\n");
-    printf("    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,^\n");
-    printf("    sm__cycles_active.avg.pct_of_peak_sustained_elapsed ^\n");
-    printf("    pfac_gpu.exe > ncu_report.txt\n\n");
-    printf("  ncu metric → paper metric mapping:\n");
-    printf("    sm__warps_active.*pct              → Warp Efficiency\n");
-    printf("    *branch_targets*uniform.pct        → 100%% - value = Branch Div.\n");
-    printf("    l1tex__t_bytes*global*ld / time    → Memory Throughput\n");
-    printf("    sm__cycles_active.*pct             → Occupancy\n");
-
-    printf("\n"); sep('-',W);
-    printf("  MEMORY OPTIMIZATION DETAILS\n"); sep('-',W);
-    printf("  Problem   : 256-wide table = %d KB → global memory thrashing\n",
-           g_ns*256*4/1024);
-    printf("  Fix 1     : 4-wide DNA table = %d KB → __constant__ memory\n",
-           g_ns*DNA_ALPHA*4/1024);
-    printf("  Fix 2     : cudaMemcpyToSymbol → broadcast per warp (free)\n");
-    printf("  Fix 3     : __ldg(&d_data[i]) → L1 texture cache for input\n");
-
-    printf("\n"); sep('-',W);
-    printf("  NOTES\n"); sep('-',W);
-    printf("  * PFAC is failure-link free: each thread walks pure trie only\n");
-    printf("  * Two-phase: Phase1 aborts most threads early (depth<%d)\n",MIN_DEPTH);
-    printf("    Only ~%.1f%% of positions pass to Phase2 (candidate rate)\n",
-           (double)r->matches/(double)(total>0?total:1)*100.0);
-    printf("  * PFAC finds overlapping matches: GPU match count > CPU AC\n");
-    printf("    This is correct by design, not an error.\n");
-    printf("    Accuracy = compare pattern IDs found, not positions.\n");
-    sep('=',W); printf("\n");
-}
-
-/* =========================================================================
- * MAIN
- * ========================================================================= */
-int main(void)
-{
-    printf("============================================================\n");
-    printf("  PFAC GPU — Two-Phase PFAC Implementation\n");
-    printf("  Ref: Lin et al., IEEE TPDS 2023 [Ref 10]\n");
-    printf("  Opts: __constant__ table + __ldg() + DNA-4 alphabet\n");
-    printf("============================================================\n\n");
-    printf("Initializing CUDA...\n"); fflush(stdout);
-
-    cudaDeviceProp dp; CUDA_CHECK(cudaGetDeviceProperties(&dp,0));
-    printf("  GPU: %s (Compute %d.%d)\n\n",dp.name,dp.major,dp.minor);
-
-    /* Load datasets */
-    printf("Loading FASTA datasets (64 MB cap each)...\n"); fflush(stdout);
-    size_t l1=0,l2=0,l3=0,l4=0;
-    printf("  [1/4] Human exons (hg38)...       "); fflush(stdout);
-    uint8_t *d1=load_fasta(PATH_EXON,  &l1, CAP_MB*1024*1024);
-    printf("%.3f MB\n",(double)l1/1e6);
-    printf("  [2/4] Human T2T CHM13...          "); fflush(stdout);
-    uint8_t *d2=load_fasta(PATH_CHM13, &l2, CAP_MB*1024*1024);
-    printf("%.3f MB\n",(double)l2/1e6);
-    printf("  [3/4] D. melanogaster r6.66...    "); fflush(stdout);
-    uint8_t *d3=load_fasta(PATH_DMEL,  &l3, CAP_MB*1024*1024);
-    printf("%.3f MB\n",(double)l3/1e6);
-    printf("  [4/4] S. cerevisiae S288c...      "); fflush(stdout);
-    uint8_t *d4=load_fasta(PATH_YEAST, &l4, 0);
-    printf("%.3f MB\n\n",(double)l4/1e6); fflush(stdout);
-
-    size_t total=l1+l2+l3+l4;
-    if(total==0){
-        fprintf(stderr,"[ERROR] No data loaded. Check dataset paths.\n"); return 1;
-    }
-    uint8_t *hdata=(uint8_t*)malloc(total+1);
-    size_t wp=0;
-    if(d1){memcpy(hdata+wp,d1,l1);wp+=l1;free(d1);}
-    if(d2){memcpy(hdata+wp,d2,l2);wp+=l2;free(d2);}
-    if(d3){memcpy(hdata+wp,d3,l3);wp+=l3;free(d3);}
-    if(d4){memcpy(hdata+wp,d4,l4);wp+=l4;free(d4);}
-    hdata[wp]='\0';
-
-    /* Extract k-mer motifs */
-    int stride=(int)(total/MAX_PATS)+1;
-    for(size_t i=0;i<total-(size_t)MAX_PAT_LEN&&g_np<MAX_PATS;i+=stride){
-        int ok=1;
-        for(int j=0;j<MAX_PAT_LEN;j++) if(hdata[i+j]==0xFF){ok=0;break;}
-        if(ok){ memcpy(g_pats[g_np],hdata+i,MAX_PAT_LEN); g_pl[g_np]=MAX_PAT_LEN; g_np++; }
-    }
-    printf("  Total input : %.3f MB\n",(double)total/1e6);
-    printf("  Motifs      : %d (k=%d nt, stride=%d)\n\n",g_np,MAX_PAT_LEN,stride);
-
-    /* Build automaton */
-    printf("Building AC trie + failure links...\n"); fflush(stdout);
-    g_ns=0; ac_new();
-    for(int i=0;i<g_np;i++) ac_insert(g_pats[i],g_pl[i],i);
-    ac_build_failure();
-    printf("  States: %d  |  PFAC table: %d KB (__constant__)\n\n",
-           g_ns,g_ns*DNA_ALPHA*4/1024); fflush(stdout);
-
-    if(g_ns>MAX_STATES){
-        fprintf(stderr,"[ERROR] %d states > MAX_STATES %d\n",g_ns,MAX_STATES);
-        free(hdata); return 1;
+    printf("\n  6. Scalability (GPU kernel time vs CPU AC on same subset):\n");
+    printf("     %-8s  %-12s  %10s  %10s  %13s  %8s\n",
+           "Motifs", "Input(MB)", "CPU(ms)", "GPU(ms)", "Throughput", "SpeedUp");
+    for (int i = 0; i < 5; i++) {
+        printf("     %-8d  %-12.3f  %10.3f  %10.3f  %7.1f MB/s  %7.2fx\n",
+               sweep[i].num_pats,
+               (double)sweep[i].input_bytes / 1e6,
+               sweep[i].cpu_ms,
+               sweep[i].gpu_kernel_ms,
+               sweep[i].throughput_mbps,
+               sweep[i].speedup);
     }
 
-    int dlen=(int)total;
+    printf("\n");
+    print_line('-', 72);
+    printf("  PROFILING METRICS  (Two-Phase PFAC Kernel)\n");
+    print_line('-', 72);
+    printf("  %-38s %10.3f ms\n", "1. Kernel Time - Phase 1 (Filter)", main_result.phase1_ms);
+    printf("  %-38s %10.3f ms\n", "   Kernel Time - Phase 2 (Verify)", main_result.phase2_ms);
+    printf("  %-38s %10.3f ms\n", "   Kernel Time - Total",            main_result.kernel_ms);
+    printf("  %-38s %9.1f %%\n",  "2. Occupancy (CUDA API)",           main_result.occupancy_pct);
+    printf("  %-38s %9s\n",       "3. Warp Efficiency",                "run ncu *");
+    printf("  %-38s %9s\n",       "4. Branch Divergence",              "run ncu *");
+    printf("  %-38s %9s\n",       "5. Memory Throughput",              "run ncu *");
+    printf("  * Use ncu command below for real paper-ready values.\n");
 
-    /* GPU warm-up */
-    printf("GPU warm-up pass...\n"); fflush(stdout);
-    { PFACResult tmp; memset(&tmp,0,sizeof(tmp));
-      int w=dlen<8192?dlen:8192; pfac_scan(hdata,w,g_matches,&tmp); }
+    printf("\n");
+    print_line('-', 72);
+    printf("  REAL PROFILING COMMAND (run this for paper metrics):\n");
+    print_line('-', 72);
+    printf("  Linux:\n");
+    printf("    ncu --metrics \\\n");
+    printf("      sm__warps_active.avg.pct_of_peak_sustained_active,\\\n");
+    printf("      smsp__sass_average_branch_targets_threads_uniform.pct,\\\n");
+    printf("      l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,\\\n");
+    printf("      sm__cycles_active.avg.pct_of_peak_sustained_elapsed \\\n");
+    printf("      ./pfac_gpu > ncu_report.txt\n\n");
+    printf("  Windows:\n");
+    printf("    ncu --metrics ^\n");
+    printf("      sm__warps_active.avg.pct_of_peak_sustained_active,^\n");
+    printf("      smsp__sass_average_branch_targets_threads_uniform.pct,^\n");
+    printf("      l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,^\n");
+    printf("      sm__cycles_active.avg.pct_of_peak_sustained_elapsed ^\n");
+    printf("      pfac_gpu.exe > ncu_report.txt\n\n");
+    printf("  ncu metric -> paper metric mapping:\n");
+    printf("    sm__warps_active.*pct              -> Warp Efficiency\n");
+    printf("    *branch_targets*uniform.pct        -> 100%% - value = Branch Div.\n");
+    printf("    l1tex__t_bytes*global*ld / time    -> Memory Throughput\n");
+    printf("    sm__cycles_active.*pct             -> Occupancy\n");
 
-    /* Main PFAC scan */
-    printf("Running Two-Phase PFAC scan...\n"); fflush(stdout);
-    PFACResult res; memset(&res,0,sizeof(res));
-    ts_t t0,t1;
-    tnow(&t0);
-    res.matches=pfac_scan(hdata,dlen,g_matches,&res);
-    tnow(&t1);
-    double gs=tsec(&t0,&t1);
-    res.exec_ms        = gs*1000.0;
-    res.throughput_mbps = (double)total/1e6/gs;
-    /* speedup vs ac_baseline — user should run ac_baseline.exe first
-       and note its exec_ms, or set cpu_ref_ms manually below         */
-    double cpu_ref_ms  = 0.0;  /* set from ac_baseline.exe output    */
-    res.speedup        = cpu_ref_ms>0 ? cpu_ref_ms/res.exec_ms : 0.0;
-    printf("  Done: %d matches in %.3f ms  (%.2f MB/s)\n",
-           res.matches,res.exec_ms,res.throughput_mbps);
-    printf("  Kernel: Phase1=%.3fms  Phase2=%.3fms  Total=%.3fms\n\n",
-           res.phase1_ms,res.phase2_ms,res.kernel_ms); fflush(stdout);
+    printf("\n");
+    print_line('-', 72);
+    printf("  NOTES\n");
+    print_line('-', 72);
+    printf("  * PFAC: one thread per input position, pure trie traversal.\n");
+    printf("  * No failure links in kernel — failure-link-free is the point.\n");
+    printf("  * Phase 1 exits early if depth < %d — most threads die here.\n",
+           FILTER_DEPTH);
+    printf("  * Phase 2 only runs for positions that passed phase 1.\n");
+    printf("  * PFAC match count can differ from AC: overlapping matches\n");
+    printf("    are both correct. Compare pattern IDs, not position counts.\n");
+    printf("  * SpeedUp = CPU AC wall time / GPU kernel time only.\n");
+    printf("    H2D/D2H transfer excluded for fair algorithmic comparison.\n");
+    print_line('=', 72);
+    printf("\n");
 
-    /* Scalability sweep */
-    printf("Scalability sweep (5 points)...\n"); fflush(stdout);
-    const double pf[]={0.10,0.25,0.50,0.75,1.00};
-    const double sf[]={0.05,0.15,0.30,0.60,1.00};
-    ScalePt sp[5];
-    for(int si=0;si<5;si++){
-        int snp=(int)(g_np*pf[si]); if(snp<1)snp=1;
-        size_t ssz=(size_t)(total*sf[si]); if(ssz<1024)ssz=1024;
-        int save=g_np; g_np=snp;
-        g_ns=0; ac_new();
-        for(int i=0;i<snp;i++) ac_insert(g_pats[i],g_pl[i],i);
-        ac_build_failure();
-        PFACResult sgr; memset(&sgr,0,sizeof(sgr));
-        tnow(&t0); pfac_scan(hdata,(int)ssz,g_tmp,&sgr); tnow(&t1);
-        double sg=tsec(&t0,&t1);
-        sp[si].np=snp; sp[si].sz=ssz;
-        sp[si].gpu_ms=sg*1000.0;
-        sp[si].throughput_mbps=(double)ssz/1e6/sg;
-        sp[si].cpu_ref_ms=0.0; /* fill from ac_baseline if available */
-        sp[si].speedup=sp[si].cpu_ref_ms>0?sp[si].cpu_ref_ms/sp[si].gpu_ms:0.0;
-        printf("  [%d/5] %3d motifs × %.2f MB : %.3f ms  (%.1f MB/s)\n",
-               si+1,snp,(double)ssz/1e6,sp[si].gpu_ms,sp[si].throughput_mbps);
-        fflush(stdout);
-        g_np=save;
-    }
-    /* restore */
-    g_ns=0; ac_new();
-    for(int i=0;i<g_np;i++) ac_insert(g_pats[i],g_pl[i],i);
-    ac_build_failure();
+    /* ── Cleanup ── */
+    free(text);
+    if (d_glob_table) cudaFree(d_glob_table);
+    if (d_glob_out)   cudaFree(d_glob_out);
+    if (d_glob_depth) cudaFree(d_glob_depth);
 
-    report(&res,sp,5,g_np,total,&dp,cpu_ref_ms);
-    free(hdata);
     return 0;
 }

@@ -1,0 +1,341 @@
+==PROF== Connected to process 13072 (C:\Users\Asus\Documents\GitHub\PFAC-Motif-Detection-for-Biological-Constraints\pfac_gpu.exe)
+========================================================================
+  PFAC GPU  —  Two-Phase PFAC (caveman edition)
+  Ref: Lin et al., IEEE TPDS 2023 [Ref 10]
+========================================================================
+
+Initializing CUDA...
+  GPU: NVIDIA GeForce RTX 4070 Laptop GPU (Compute 8.9, 36 SMs, 8.6 GB)
+
+Loading FASTA datasets (cap: 256 MB each)...
+  [1/4] Human exons (hg38)    ... 257.657 MB
+  [2/4] Human T2T CHM13       ... 268.435 MB
+  [3/4] D. melanogaster r6.66 ... 268.435 MB
+  [4/4] S. cerevisiae S288c   ... [WARN] States (7100) > CONST_MEM_MAX_STATES (2048): using global memory.
+==PROF== Profiling "kernel_phase1_global" - 0: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 1: 0%....50%....100% - 3 passes
+12.328 MB
+
+  Total input : 806.856 MB
+  Motifs      : 497 (k=18 nt, stride=1575892)
+
+Building AC trie + failure links...
+  States: 7100  |  PFAC table: 110 KB (global memory)
+
+GPU warm-up...
+Measuring CPU AC reference time...
+  CPU AC: 196327 matches in 6318.503 ms
+
+Running Two-Phase PFAC scan...
+[WARN] States (7100) > CONST_MEM_MAX_STATES (2048): using global memory.
+==PROF== Profiling "kernel_phase1_global" - 2: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 3: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase1_global" - 4: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 5: 0%....50%....100% - 3 passes
+  Done: 196327 matches in 2053.776 ms wall / 1776.925 ms kernel  (454.07 MB/s)
+  Kernel: Phase1=957.851ms  Phase2=819.074ms  Total=1776.925ms
+
+Scalability sweep (5 points, CPU + GPU each)...
+==PROF== Profiling "kernel_phase1_const" - 6: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_const" - 7: 0%....50%....100% - 3 passes
+  [1/5]  49 motifs x 40.34 MB : CPU=214.748ms  GPU=134.080ms  1.60x
+==PROF== Profiling "kernel_phase1_const" - 8: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_const" - 9: 0%....50%....100% - 3 passes
+  [2/5] 124 motifs x 121.03 MB : CPU=747.235ms  GPU=467.501ms  1.60x
+[WARN] States (3665) > CONST_MEM_MAX_STATES (2048): using global memory.
+==PROF== Profiling "kernel_phase1_global" - 10: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 11: 0%....50%....100% - 3 passes
+  [3/5] 248 motifs x 242.06 MB : CPU=1606.794ms  GPU=428.149ms  3.75x
+[WARN] States (5386) > CONST_MEM_MAX_STATES (2048): using global memory.
+==PROF== Profiling "kernel_phase1_global" - 12: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 13: 0%....50%....100% - 3 passes
+  [4/5] 372 motifs x 484.11 MB : CPU=3713.868ms  GPU=976.699ms  3.80x
+[WARN] States (7100) > CONST_MEM_MAX_STATES (2048): using global memory.
+==PROF== Profiling "kernel_phase1_global" - 14: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 15: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase1_global" - 16: 0%....50%....100% - 3 passes
+==PROF== Profiling "kernel_phase2_global" - 17: 0%....50%....100% - 3 passes
+  [5/5] 497 motifs x 806.86 MB : CPU=6543.757ms  GPU=1631.549ms  4.01x
+
+========================================================================
+  PFAC GPU — BENCHMARK RESULTS
+  Ref: Lin et al., IEEE TPDS 2023 (Two-Phase PFAC) [Ref 10]
+========================================================================
+
+  GPU         : NVIDIA GeForce RTX 4070 Laptop GPU  (Compute 8.9, 36 SMs, 8.6 GB)
+  Algorithm   : Two-Phase PFAC (Phase1=Filter, Phase2=Verify)
+  Alphabet    : DNA 4-symbol {A,C,G,T}
+  Table       : 7100 states x 4 x 4B = 110 KB (global memory)
+  Patterns    : 497 k-mers (k=18 nt)  |  AC States: 7100
+  Input       : 806.856 MB (806856265 bytes)
+
+------------------------------------------------------------------------
+  COMPARISON METRICS  (compare with ac_baseline output)
+------------------------------------------------------------------------
+  1a. Execution Time (wall)                2053.776 ms
+  1b. Execution Time (kernel)              1776.925 ms
+  2. Throughput (kernel time)                454.07 MB/s
+  3. SpeedUp (kernel vs CPU AC)                3.56x
+     CPU AC reference               :  6318.503 ms
+  4. Memory Usage (GPU)                     1141.02 MB
+  5. Matches Found                           196327
+     Accuracy note                  :  PFAC finds overlapping hits (see Notes)
+
+  6. Scalability (GPU kernel time vs CPU AC on same subset):
+     Motifs    Input(MB)        CPU(ms)     GPU(ms)     Throughput   SpeedUp
+     49        40.343           214.748     134.080    300.9 MB/s     1.60x
+     124       121.028          747.235     467.501    258.9 MB/s     1.60x
+     248       242.057         1606.794     428.149    565.4 MB/s     3.75x
+     372       484.114         3713.868     976.699    495.7 MB/s     3.80x
+     497       806.856         6543.757    1631.549    494.5 MB/s     4.01x
+
+------------------------------------------------------------------------
+  PROFILING METRICS  (Two-Phase PFAC Kernel)
+------------------------------------------------------------------------
+  1. Kernel Time - Phase 1 (Filter)         957.851 ms
+     Kernel Time - Phase 2 (Verify)         819.074 ms
+     Kernel Time - Total                   1776.925 ms
+  2. Occupancy (CUDA API)                    100.0 %
+  3. Warp Efficiency                     run ncu *
+  4. Branch Divergence                   run ncu *
+  5. Memory Throughput                   run ncu *
+  * Use ncu command below for real paper-ready values.
+
+------------------------------------------------------------------------
+  REAL PROFILING COMMAND (run this for paper metrics):
+------------------------------------------------------------------------
+  Linux:
+    ncu --metrics \
+      sm__warps_active.avg.pct_of_peak_sustained_active,\
+      smsp__sass_average_branch_targets_threads_uniform.pct,\
+      l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,\
+      sm__cycles_active.avg.pct_of_peak_sustained_elapsed \
+      ./pfac_gpu > ncu_report.txt
+
+  Windows:
+    ncu --metrics ^
+      sm__warps_active.avg.pct_of_peak_sustained_active,^
+      smsp__sass_average_branch_targets_threads_uniform.pct,^
+      l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,^
+      sm__cycles_active.avg.pct_of_peak_sustained_elapsed ^
+      pfac_gpu.exe > ncu_report.txt
+
+  ncu metric -> paper metric mapping:
+    sm__warps_active.*pct              -> Warp Efficiency
+    *branch_targets*uniform.pct        -> 100% - value = Branch Div.
+    l1tex__t_bytes*global*ld / time    -> Memory Throughput
+    sm__cycles_active.*pct             -> Occupancy
+
+------------------------------------------------------------------------
+  NOTES
+------------------------------------------------------------------------
+  * PFAC: one thread per input position, pure trie traversal.
+  * No failure links in kernel — failure-link-free is the point.
+  * Phase 1 exits early if depth < 6 — most threads die here.
+  * Phase 2 only runs for positions that passed phase 1.
+  * PFAC match count can differ from AC: overlapping matches
+    are both correct. Compare pattern IDs, not position counts.
+  * SpeedUp = CPU AC wall time / GPU kernel time only.
+    H2D/D2H transfer excluded for fair algorithmic comparison.
+========================================================================
+
+==PROF== Disconnected from process 13072
+[13072] pfac_gpu.exe@127.0.0.1
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (32, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Mbyte         1.08
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        64.02
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        14.38
+    smsp__sass_average_branch_targets_threads_uniform.pct           %        99.77
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (32, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Kbyte       363.36
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        47.88
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        13.23
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (2097152, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        89.98
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        85.47
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (2097152, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        33.07
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        79.17
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (1054631, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        47.06
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        85.84
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (1054631, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        16.14
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        78.91
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_const(const unsigned char *, int, unsigned char *) (157590, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Mbyte       364.19
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.97
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        82.64
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_const(const unsigned char *, int, const unsigned char *, int *, Match *, int) (157590, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Mbyte       156.43
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.81
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        64.92
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_const(const unsigned char *, int, unsigned char *) (472768, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte         1.19
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        84.41
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_const(const unsigned char *, int, const unsigned char *, int *, Match *, int) (472768, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Mbyte       813.41
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        70.80
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (945535, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        33.84
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        86.32
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (945535, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte         8.80
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        77.00
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (1891070, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        75.97
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        86.28
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (1891070, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        24.59
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        78.82
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (2097152, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        89.98
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        85.47
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (2097152, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        33.07
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.99
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        79.17
+    smsp__sass_average_branch_targets_threads_uniform.pct           %       100.00
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase1_global(const unsigned char *, int, unsigned char *, const int *, const int *) (1054631, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        47.06
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        85.84
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
+  kernel_phase2_global(const unsigned char *, int, const unsigned char *, int *, Match *, int, const int *, const int *) (1054631, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    ----------------------------------------------------- ----------- ------------
+    Metric Name                                           Metric Unit Metric Value
+    ----------------------------------------------------- ----------- ------------
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum                Gbyte        16.14
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed             %        99.98
+    sm__warps_active.avg.pct_of_peak_sustained_active               %        78.92
+    smsp__sass_average_branch_targets_threads_uniform.pct           %          100
+    ----------------------------------------------------- ----------- ------------
+
