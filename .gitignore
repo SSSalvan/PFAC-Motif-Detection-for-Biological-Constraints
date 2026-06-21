@@ -1,26 +1,48 @@
-# --- DATASET & LARGE FILES ---
-data/
-Datasets/
+# Build directories
+build/
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+*.cmake
 
-*.gz
-*.tar.gz
-*.fna
-*.fasta
-*.crdownload
-
-# --- COMPILED BINARIES (CUDA/C++) ---
-bin/
-
-# File objek dan executable hasil kompilasi
-*.exe
+# Compiled files
 *.o
 *.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
 *.out
 
-# --- IDE & SYSTEM ---
-.vscode/
-.DS_Store
-Thumbs.db
+# CUDA
+*.cubin
+*.ptx
 
-# --- HASIL RISET ---
-results/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Data files (large)
+data/large_*
+*.fasta.bak
+
+# Logs
+*.log
+
+# Dependencies
+*.a
+*.lib
+
+# Test outputs
+test_output/
+*.test
